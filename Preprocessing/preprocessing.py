@@ -123,37 +123,6 @@ def segment_hand_grabcut(img):
     
     return binary_mask, segmented
 
-def normalize_brightness(img):
-    """
-    Normalize brightness for saving
-    Ensures saved image matches visualization brightness
-    
-    Args:
-        img: Input image
-    
-    Returns:
-        Normalized image (0-255 range, uint8)
-    """
-    # If image is float, convert to uint8
-    if img.dtype == np.float32 or img.dtype == np.float64:
-        img_min = np.min(img)
-        img_max = np.max(img)
-        
-        if img_max > img_min:
-            # Normalize to 0-255
-            normalized = ((img - img_min) / (img_max - img_min) * 255).astype(np.uint8)
-        else:
-            normalized = img.astype(np.uint8)
-    else:
-        normalized = img
-    
-    # Apply histogram equalization for better visibility
-    # This matches what matplotlib does for display
-    normalized = cv2.equalizeHist(normalized)
-    
-    print(f"✓ Brightness normalized for saving")
-    return normalized
-
 def visualize_pipeline(original, blurred, cropped, mask, segmented):
     """Show full preprocessing pipeline"""
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -178,14 +147,12 @@ def visualize_pipeline(original, blurred, cropped, mask, segmented):
     axes[1, 1].set_title('5. Segmented Hand')
     axes[1, 1].axis('off')
     
-    # Show final normalized version (what will be saved)
-    segmented_normalized = normalize_brightness(segmented)
-    axes[1, 2].imshow(segmented_normalized, cmap='gray')
-    axes[1, 2].set_title('6. Normalized (Saved)')
+    # Hide the 6th subplot
     axes[1, 2].axis('off')
     
     plt.tight_layout()
     plt.show()
+
 
 # Main execution
 if __name__ == "__main__":
@@ -214,15 +181,12 @@ if __name__ == "__main__":
     print("\nSegmenting hand with GrabCut...")
     mask, img_segmented = segment_hand_grabcut(img_cropped)
     
-    # Normalize brightness before saving
-    img_final = normalize_brightness(img_segmented)
-    
     # Visualize all steps
-    visualize_pipeline(img_original, img_blurred, img_cropped, mask, img_final)
+    visualize_pipeline(img_original, img_blurred, img_cropped, mask, img_segmented)
     
-    # Save normalized result
-    cv2.imwrite(output_path, img_final)
-    print(f"\n✓ Saved final image: {output_path}")
+    # Save result
+    cv2.imwrite(output_path, img_segmented)
+    print(f"\n✓ Saved segmented image: {output_path}")
     
     print("\n" + "="*60)
     print("Pipeline Complete!")
