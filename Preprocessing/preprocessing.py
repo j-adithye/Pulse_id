@@ -157,7 +157,7 @@ def visualize_pipeline(original, blurred, cropped, mask, segmented):
 # Main execution
 if __name__ == "__main__":
     # Image paths
-    image_path = "C://Users//adith//OneDrive//Documents//py//Pulse_id//image//vein.jpg"
+    image_path = "C://pi//vein_fundan_palm_testdose.jpg"
     output_path = "C://Users//adith//OneDrive//Documents//py//Pulse_id//image//vein_processed.jpg"
     
     print("="*60)
