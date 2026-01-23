@@ -2,7 +2,7 @@
 """
 Step 1: Gaussian Blur
 Step 2: Rectangle Crop (Fast)
-Step 3: GrabCut Segmentation (On cropped region - faster)
+Step 3: Otsu Thresholding Segmentation
 """
 
 import cv2
@@ -66,10 +66,10 @@ def crop_hand_region(img):
     
     return cropped, crop_coords
 
-def segment_hand_grabcut(img):
+def segment_hand_otsu(img):
     """
-    Segment hand using GrabCut algorithm
-    Runs on already-cropped image so it's faster
+    Segment hand using Otsu thresholding with contour filtering
+    Keeps only the largest region (hand), removes noise
     
     Args:
         img: Cropped grayscale image
@@ -81,45 +81,35 @@ def segment_hand_grabcut(img):
     import time
     start_time = time.time()
     
-    # GrabCut needs RGB image
-    img_3channel = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    print("Running Otsu thresholding...")
     
-    # Create a mask for GrabCut
-    mask = np.zeros(img.shape[:2], np.uint8)
+    # Apply Otsu's thresholding (inverted for NIR)
+    _, binary_mask = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # Define rectangle (use most of the cropped region)
-    height, width = img.shape
-    margin_x = int(width * 0.05)   # 5% margin
-    margin_y = int(height * 0.05)  # 5% margin
-    
-    rect = (margin_x, margin_y, 
-            width - 2*margin_x, 
-            height - 2*margin_y)
-    
-    # Background and foreground models
-    bgd_model = np.zeros((1, 65), np.float64)
-    fgd_model = np.zeros((1, 65), np.float64)
-    
-    print("Running GrabCut on cropped region...")
-    
-    # Run GrabCut (fewer iterations since we already cropped)
-    cv2.grabCut(img_3channel, mask, rect, bgd_model, fgd_model, 
-                3, cv2.GC_INIT_WITH_RECT)  # 3 iterations (was 5)
-    
-    # Create binary mask
-    binary_mask = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
-    binary_mask = binary_mask * 255
-    
-    # Clean up mask
+    # Clean up mask with morphological operations
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
     binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+    
+    # Find contours to remove noise
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if contours:
+        # Keep only the largest contour (hand)
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        # Create clean mask with only the largest contour
+        clean_mask = np.zeros_like(binary_mask)
+        cv2.drawContours(clean_mask, [largest_contour], -1, 255, -1)
+        
+        binary_mask = clean_mask
+        print(f"✓ Kept largest contour, removed noise")
     
     # Apply mask to original image
     segmented = cv2.bitwise_and(img, img, mask=binary_mask)
     
     elapsed = time.time() - start_time
-    print(f"✓ GrabCut segmentation complete in {elapsed:.2f} seconds")
+    print(f"✓ Otsu segmentation complete in {elapsed:.4f} seconds")
     
     return binary_mask, segmented
 
@@ -140,7 +130,7 @@ def visualize_pipeline(original, blurred, cropped, mask, segmented):
     axes[0, 2].axis('off')
     
     axes[1, 0].imshow(mask, cmap='gray')
-    axes[1, 0].set_title('4. GrabCut Mask')
+    axes[1, 0].set_title('4. Otsu Mask')
     axes[1, 0].axis('off')
     
     axes[1, 1].imshow(segmented, cmap='gray')
@@ -157,14 +147,14 @@ def visualize_pipeline(original, blurred, cropped, mask, segmented):
 # Main execution
 if __name__ == "__main__":
     # Image paths
-    image_path = "C://pi//vein_fundan_palm_testdose.jpg"
+    image_path = "C://Users//adith//OneDrive//Documents//py//Pulse_id//image//vein.jpg"
     output_path = "C://Users//adith//OneDrive//Documents//py//Pulse_id//image//vein_processed.jpg"
     
     print("="*60)
     print("Palm Vein Preprocessing Pipeline")
     print("Step 1: Gaussian Blur")
     print("Step 2: Rectangle Crop (removes most background)")
-    print("Step 3: GrabCut Segmentation (on cropped region - faster)")
+    print("Step 3: Otsu Thresholding (fast segmentation)")
     print("="*60)
     
     # Load image
@@ -177,9 +167,9 @@ if __name__ == "__main__":
     print("\nCropping to hand region...")
     img_cropped, crop_coords = crop_hand_region(img_blurred)
     
-    # Step 3: GrabCut segmentation (on cropped image - faster!)
-    print("\nSegmenting hand with GrabCut...")
-    mask, img_segmented = segment_hand_grabcut(img_cropped)
+    # Step 3: Otsu thresholding segmentation (fast!)
+    print("\nSegmenting hand with Otsu...")
+    mask, img_segmented = segment_hand_otsu(img_cropped)
     
     # Visualize all steps
     visualize_pipeline(img_original, img_blurred, img_cropped, mask, img_segmented)
@@ -190,6 +180,5 @@ if __name__ == "__main__":
     
     print("\n" + "="*60)
     print("Pipeline Complete!")
-    print("Expected speed: ~20-40 seconds per image")
-    print("(Much faster than 80s due to cropping first)")
+    print("Expected speed: <1 second per image")
     print("="*60)
