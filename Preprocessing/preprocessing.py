@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Step 1: Gaussian Blur
 Step 2: Rectangle Crop (Fast)
@@ -33,17 +32,7 @@ def apply_gaussian_blur(img, kernel_size=11):
     return blurred
 
 def crop_hand_region(img):
-    """
-    Crop to hand region using fixed rectangle
-    This removes most background and speeds up GrabCut
-    
-    Args:
-        img: Blurred grayscale image
-    
-    Returns:
-        cropped: Cropped hand region
-        crop_coords: (x, y, width, height) for reference
-    """
+   
     import time
     start_time = time.time()
     
@@ -67,24 +56,14 @@ def crop_hand_region(img):
     return cropped, crop_coords
 
 def segment_hand_otsu(img):
-    """
-    Segment hand using Otsu thresholding with contour filtering
-    Keeps only the largest region (hand), removes noise
     
-    Args:
-        img: Cropped grayscale image
-    
-    Returns:
-        mask: Binary mask of hand region
-        segmented: Hand image with background removed
-    """
     import time
     start_time = time.time()
     
     print("Running Otsu thresholding...")
     
     # Apply Otsu's thresholding (inverted for NIR)
-    _, binary_mask = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    _, binary_mask = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
     # Clean up mask with morphological operations
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
@@ -147,7 +126,7 @@ def visualize_pipeline(original, blurred, cropped, mask, segmented):
 # Main execution
 if __name__ == "__main__":
     # Image paths
-    image_path = "C://Users//adith//OneDrive//Documents//py//Pulse_id//image//vein.jpg"
+    image_path = "C://Users//adith//OneDrive//Documents//py//Pulse_id//image//vein_blk.jpg"
     output_path = "C://Users//adith//OneDrive//Documents//py//Pulse_id//image//vein_processed.jpg"
     
     print("="*60)
