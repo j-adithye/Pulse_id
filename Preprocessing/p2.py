@@ -13,7 +13,7 @@ Pipeline:
   5. Finger Removal  (MCP knuckle line via convexity defects)
   6. Otsu Segmentation
   7. CLAHE pre-enhancement  (boosts low-contrast NIR vein structure)
-  8. Frangi Vesselness Filter  (pure NumPy/SciPy, no DLL issues)
+  8. Sato Vesselness Filter  (pure NumPy/SciPy, no DLL issues)
   9. CLAHE post-enhancement
  10. Resize to 224x224
  11. Z-score Normalization
@@ -31,7 +31,7 @@ from scipy.ndimage import uniform_filter1d
 #  CONFIGURATION  -- edit these values to tune the pipeline
 # ==============================================================================
 
-IMAGE_PATH  = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\dataset\\person9\\vein_1.jpg"
+IMAGE_PATH  = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\dataset\\person92\\vein_1.jpg"
 OUTPUT_PATH = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\image\\vein_processed.jpg"
 
 # -- Otsu threshold offset -----------------------------------------------------
@@ -48,12 +48,12 @@ OTSU_OFFSET = -20
 #   Higher = more conservative cut (removes more wrist)
 WRIST_JUNCTION_RISE = 0.15
 
-# -- Frangi filter -------------------------------------------------------------
-FRANGI_SCALE_MIN  = 1    # minimum vein thickness to detect (pixels)
-FRANGI_SCALE_MAX  = 10   # maximum vein thickness to detect (pixels)
-FRANGI_SCALE_STEP = 1    # step between scales (1 = thorough, 2 = faster)
-FRANGI_ALPHA      = 0.5  # plate-like vs line-like sensitivity
-FRANGI_BETA       = 0.5  # blob suppression
+# -- Sato filter -------------------------------------------------------------
+Sato_SCALE_MIN  = 1    # minimum vein thickness to detect (pixels)
+Sato_SCALE_MAX  = 2    # maximum vein thickness to detect (pixels)
+Sato_SCALE_STEP = 1    # step between scales (1 = thorough, 2 = faster)
+Sato_ALPHA      = 0.7  # plate-like vs line-like sensitivity
+Sato_BETA       = 0.9  # blob suppression
 
 # -- Finger removal ------------------------------------------------------------
 #   Uses convexity defects to locate the MCP knuckle line (where fingers begin
@@ -69,8 +69,8 @@ MCP_SAFETY_MARGIN    = 0.03
 MCP_DEFECT_DEPTH_MIN = 20    # pixels
 
 # -- CLAHE ---------------------------------------------------------------------
-CLAHE_PRE_CLIP  = 3.0  # clip limit for pre-Frangi CLAHE (boosts NIR contrast)
-CLAHE_POST_CLIP = 2.0  # clip limit for post-Frangi CLAHE
+CLAHE_PRE_CLIP  = 1.5  # clip limit for pre-Sato CLAHE (boosts NIR contrast)
+CLAHE_POST_CLIP = 0.5  # clip limit for post-Sato CLAHE
 CLAHE_TILE_SIZE = 8    # tile grid size for both passes
 
 # ==============================================================================
@@ -152,108 +152,120 @@ def smart_crop_hand_region(img, target_size=(512, 512),
     return cropped, {'bbox': (bx, by, bw, bh), 'otsu': adj}
 
 
-def remove_wrist_geometric(img, otsu_offset=0, junction_rise=0.15):
+def remove_wrist_geometric(img, otsu_offset=0, junction_rise=0.2):
     """
-    Remove the wrist / forearm using a column-height profile analysis.
+    Wrist removal using distance-transform-based thickness profiling.
+    Assumes FIXED orientation:
+        - Wrist on LEFT
+        - Fingers on RIGHT
 
-    Works purely with OpenCV and NumPy -- no external model needed.
-    Automatically detects which side the wrist enters from (left or right).
+    Robust to hair, boundary noise, and weak silhouettes.
 
     Args:
-        img           : Cropped grayscale image (post smart-crop).
-        otsu_offset   : Same offset used for segmentation.
-        junction_rise : Where to cut relative to the wrist-to-palm width rise.
-                        0.15 = slightly above the wrist crease (safe default).
+        img           : Cropped grayscale image (uint8).
+        otsu_offset   : Offset added to Otsu threshold.
+        junction_rise : Fraction of wrist-to-palm thickness rise at which to cut.
+                        0.2 is a safe default.
+
     Returns:
         img_no_wrist  : Image with wrist region zeroed out.
-        cut_col       : Column where the cut was made.
-        orientation   : 'left' or 'right' -- which side the wrist entered from.
+        cut_col       : Column where wrist was removed.
+        wrist_side    : Always 'left'
     """
+    import time
+    import cv2
+    import numpy as np
+    from scipy.ndimage import uniform_filter1d
+
     t0 = time.time()
     h, w = img.shape
 
-    otsu_val, _ = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # ------------------------------------------------------------
+    # 1. Binary hand mask (hair noise is OK)
+    # ------------------------------------------------------------
+    otsu_val, _ = cv2.threshold(
+        img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
     adj = int(np.clip(otsu_val + otsu_offset, 0, 255))
     _, binary = cv2.threshold(img, adj, 255, cv2.THRESH_BINARY)
+
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
 
+    contours, _ = cv2.findContours(
+        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
     if not contours:
-        print("  WARNING: No contour found -- skipping wrist removal")
-        return img.copy(), None, None
+        print("  WARNING: No contour found — skipping wrist removal")
+        return img.copy(), None, 'left'
 
     hand_mask = np.zeros_like(binary)
-    cv2.drawContours(hand_mask, [max(contours, key=cv2.contourArea)], -1, 255, -1)
+    cv2.drawContours(
+        hand_mask,
+        [max(contours, key=cv2.contourArea)],
+        -1, 255, -1
+    )
 
-    col_heights = np.array([np.sum(hand_mask[:, c] > 0) for c in range(w)],
-                           dtype=np.float32)
-    smoothed    = uniform_filter1d(col_heights, size=max(10, w // 50))
+    # ------------------------------------------------------------
+    # 2. Distance transform → interior thickness
+    # ------------------------------------------------------------
+    dist = cv2.distanceTransform(hand_mask, cv2.DIST_L2, 5)
 
-    nz         = np.where(col_heights > 0)[0]
-    hand_start = int(nz[0])
-    hand_end   = int(nz[-1])
+    # Thickness profile = max inscribed radius per column
+    thickness = np.array(
+        [dist[:, c].max() for c in range(w)], dtype=np.float32
+    )
+
+    # Smooth profile (important)
+    thickness = uniform_filter1d(thickness, size=max(10, w // 40))
+
+    nz = np.where(thickness > 0)[0]
+    if len(nz) < 10:
+        print("  WARNING: Hand region too small — skipping wrist removal")
+        return img.copy(), None, 'left'
+
+    hand_start = nz[0]
+    hand_end   = nz[-1]
     span       = hand_end - hand_start
 
-    palm_peak = float(np.max(smoothed[hand_start:hand_end]))
+    # ------------------------------------------------------------
+    # 3. Wrist → palm junction via thickness rise
+    # ------------------------------------------------------------
+    check_len = max(5, int(span * 0.15))
 
-    # Detect wrist side:
-    # The wrist is a SOLID rectangular entry — its first columns are consistently
-    # wider than the fingertip side (which tapers off as scattered narrow protrusions).
-    # Compare the MINIMUM column height in the first 15% vs last 15% of the hand span.
-    # The wrist side has a higher minimum (solid cylinder), fingertip side has a lower
-    # minimum (gaps between fingers).
-    check_len  = max(5, int(span * 0.15))
-    left_min   = float(np.min(smoothed[hand_start:hand_start + check_len]))
-    right_min  = float(np.min(smoothed[hand_end - check_len:hand_end]))
-    # Also check the mean of those windows
-    left_mean  = float(np.mean(smoothed[hand_start:hand_start + check_len]))
-    right_mean = float(np.mean(smoothed[hand_end - check_len:hand_end]))
-    # Wrist side has both higher min and higher mean (solid entry)
-    left_score  = left_min  + left_mean
-    right_score = right_min + right_mean
-    wrist_left  = left_score >= right_score
-    side = 'left' if wrist_left else 'right'
-    print(f"  Wrist enters from the {side.upper()} side  "
-          f"(left_score={left_score:.0f}  right_score={right_score:.0f}  "
-          f"palm_peak={palm_peak:.0f})")
+    wrist_thick = float(
+        np.median(thickness[hand_start : hand_start + check_len])
+    )
+    palm_peak = float(thickness.max())
 
-    if wrist_left:
-        # Scan left-to-right; plateau is at the beginning
-        half_end   = hand_start + span // 2
-        plateau_h  = float(np.median(smoothed[hand_start:hand_start + max(1, span // 6)]))
-        cut_thresh = plateau_h + (palm_peak - plateau_h) * junction_rise
-        junction   = None
-        for c in range(hand_start, half_end):
-            if smoothed[c] > cut_thresh:
-                junction = c
-                break
-        if junction is None:
-            junction = hand_start + span // 4
-        cut_col = max(hand_start, junction - int(w * 0.015))
-        img_no_wrist = img.copy()
-        img_no_wrist[:, :cut_col] = 0
-        print(f"  Junction col={junction}  ->  cut at col={cut_col} (zeroing left of cut)")
-    else:
-        # Scan right-to-left; plateau is at the end
-        half_start = hand_end - span // 2
-        plateau_h  = float(np.median(smoothed[hand_end - max(1, span // 6):hand_end]))
-        cut_thresh = plateau_h + (palm_peak - plateau_h) * junction_rise
-        junction   = None
-        for c in range(hand_end, half_start, -1):
-            if smoothed[c] > cut_thresh:
-                junction = c
-                break
-        if junction is None:
-            junction = hand_end - span // 4
-        cut_col = min(hand_end, junction + int(w * 0.015))
-        img_no_wrist = img.copy()
-        img_no_wrist[:, cut_col:] = 0
-        print(f"  Junction col={junction}  ->  cut at col={cut_col} (zeroing right of cut)")
+    cut_thresh = wrist_thick + (palm_peak - wrist_thick) * junction_rise
 
-    print(f"  Wrist removal done in {time.time()-t0:.3f}s")
-    return img_no_wrist, cut_col, side
+    junction = None
+    for c in range(hand_start + check_len, hand_start + span // 2):
+        if thickness[c] > cut_thresh:
+            junction = c
+            break
+
+    if junction is None:
+        junction = hand_start + span // 4
+
+    # Small safety offset toward wrist
+    cut_col = max(hand_start, junction - int(w * 0.015))
+
+    img_no_wrist = img.copy()
+    img_no_wrist[:, :cut_col] = 0
+
+    print(
+        f"  Wrist removed at column {cut_col}  "
+        f"(wrist_thick={wrist_thick:.1f}, palm_peak={palm_peak:.1f})"
+    )
+    print(
+        f"  Wrist removal done in {time.time() - t0:.3f}s  "
+        f"[distance-transform]"
+    )
+
+    return img_no_wrist, cut_col, 'left'
 
 
 
@@ -318,7 +330,7 @@ def remove_fingers_mcp(img, wrist_cut_col, wrist_side,
         return out, cut_coord
 
     safety_px = int((w if wrist_side in ('left', 'right') else h) * safety_margin)
-
+    '''
     # ==================================================================
     # PRIMARY: MediaPipe HandLandmarker
     # ==================================================================
@@ -419,75 +431,93 @@ def remove_fingers_mcp(img, wrist_cut_col, wrist_side,
 
         except Exception as e:
             print(f"  MediaPipe error ({e}) — using fallback method")
-
+    '''
     # ==================================================================
-    # FALLBACK: column-segment counting  (no model needed)
+    # FALLBACK: Convex Hull + Convexity Defects
     # ==================================================================
-    print("  Using fallback: column-segment counting")
+    print("  Using fallback: convex hull + convexity defects")
 
-    otsu_val, _ = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    otsu_val, _ = cv2.threshold(img, 0, 255,
+                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     adj = int(np.clip(otsu_val + otsu_offset, 0, 255))
     _, binary = cv2.threshold(img, adj, 255, cv2.THRESH_BINARY)
+
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(binary,
+                                cv2.RETR_EXTERNAL,
+                                cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
         print("  WARNING: No contour found — skipping finger removal")
         return img.copy(), None
 
-    hand_mask = np.zeros_like(binary)
-    cv2.drawContours(hand_mask, [max(contours, key=cv2.contourArea)], -1, 255, -1)
+    cnt = max(contours, key=cv2.contourArea)
 
-    def count_segments(arr):
-        in_seg, count = False, 0
-        for px in arr:
-            if px > 0 and not in_seg: count += 1; in_seg = True
-            elif px == 0:             in_seg = False
-        return count
+    # Convex hull (indices required for defects)
+    hull = cv2.convexHull(cnt, returnPoints=False)
 
-    horizontal = wrist_side in ('left', 'right')
-    profile    = ([np.sum(hand_mask[:, c] > 0) for c in range(w)] if horizontal
-                  else [np.sum(hand_mask[r, :] > 0) for r in range(h)])
-    nz         = np.where(np.array(profile) > 0)[0]
-
-    if len(nz) < 10:
-        print("  WARNING: Hand mask too sparse — skipping finger removal")
+    if hull is None or len(hull) < 3:
+        print("  WARNING: Convex hull failed — skipping finger removal")
         return img.copy(), None
 
-    entry_idx = int(nz[0])
-    exit_idx  = int(nz[-1])
-    scan_fwd  = wrist_side in ('left', 'top')
-    scan_rng  = (range(entry_idx + 5, exit_idx - 5) if scan_fwd
-                 else range(exit_idx - 5, entry_idx + 5, -1))
-    step      = 1 if scan_fwd else -1
+    defects = cv2.convexityDefects(cnt, hull)
 
-    split_idx = None
-    for idx in scan_rng:
-        get = lambda i: (count_segments(hand_mask[:, i]) if horizontal
-                         else count_segments(hand_mask[i, :]))
-        if get(idx) > 1 and get(idx + step) > 1 and get(idx + 2*step) > 1:
-            split_idx = idx
-            break
-
-    if split_idx is None:
-        print("  WARNING: No finger split found — skipping finger removal")
+    if defects is None:
+        print("  WARNING: No convexity defects found — skipping finger removal")
         return img.copy(), None
 
-    wrist_bound = wrist_cut_col if wrist_cut_col is not None else entry_idx
-    if wrist_side == 'left':
-        mcp_cut = max(wrist_bound, split_idx - safety_px)
-    elif wrist_side == 'right':
-        mcp_cut = min(wrist_bound, split_idx + safety_px)
-    elif wrist_side == 'top':
-        mcp_cut = max(wrist_bound, split_idx - safety_px)
+    # Collect deep defects (finger valleys)
+    valley_pts = []
+    for d in defects:
+        s, e, f, depth = d[0]
+        depth_px = depth / 256.0
+        if depth_px > defect_depth_min:
+            far = cnt[f][0]   # deepest valley point
+            valley_pts.append(far)
+
+    if len(valley_pts) < 2:
+        print("  WARNING: Insufficient finger valleys — skipping finger removal")
+        return img.copy(), None
+
+    valley_pts = np.array(valley_pts)
+
+    # Estimate MCP cut line
+    if wrist_side in ('left', 'right'):
+        raw_cut = int(np.mean(valley_pts[:, 0]))   # x-coordinate
+        safety_px = int(w * safety_margin)
     else:
-        mcp_cut = min(wrist_bound, split_idx + safety_px)
+        raw_cut = int(np.mean(valley_pts[:, 1]))   # y-coordinate
+        safety_px = int(h * safety_margin)
 
-    img_out, mcp_cut = apply_cut(mcp_cut)
-    print(f"  Fallback: split at idx={split_idx}  safety={safety_px}px  cut={mcp_cut}")
-    print(f"  Finger removal done in {time.time()-t0:.3f}s  [fallback]")
+    wrist_bound = wrist_cut_col if wrist_cut_col is not None else 0
+
+    if wrist_side == 'left':
+        mcp_cut = max(wrist_bound, raw_cut - safety_px)
+    elif wrist_side == 'right':
+        mcp_cut = min(wrist_bound, raw_cut + safety_px)
+    elif wrist_side == 'top':
+        mcp_cut = max(wrist_bound, raw_cut - safety_px)
+    else:
+        mcp_cut = min(wrist_bound, raw_cut + safety_px)
+
+    # Apply cut
+    img_out = img.copy()
+    if wrist_side == 'left':
+        img_out[:, mcp_cut:] = 0
+    elif wrist_side == 'right':
+        img_out[:, :mcp_cut] = 0
+    elif wrist_side == 'top':
+        img_out[mcp_cut:, :] = 0
+    else:
+        img_out[:mcp_cut, :] = 0
+
+    print(f"  Convexity fallback: valleys={len(valley_pts)}  "
+        f"raw_cut={raw_cut}  safety={safety_px}px  cut={mcp_cut}")
+    print(f"  Finger removal done in {time.time()-t0:.3f}s  [convexity]")
+
     return img_out, mcp_cut
 
 
@@ -528,88 +558,49 @@ def apply_clahe(img, clip_limit=2.0, tile_size=8, label=""):
     return enhanced
 
 
-def _frangi_pure(img_float, sigmas, alpha=0.5, beta=0.5, black_ridges=True):
+def apply_sato_filter(img,
+                      scale_min=1,
+                      scale_max=3,
+                      scale_step=1,
+                      black_ridges=True):
     """
-    Pure NumPy/SciPy implementation of the Frangi vesselness filter.
-    Identical mathematics to skimage.filters.frangi — no compiled C extensions.
+    Apply Sato vesselness filter for palm vein enhancement.
 
-    For each scale sigma:
-      1. Smooth with Gaussian
-      2. Compute the 2-D Hessian via second derivatives
-      3. Get eigenvalues lambda1, lambda2  (|lambda1| <= |lambda2|)
-      4. Compute vesselness score V = exp(-Rb²/2β²) * (1 - exp(-S²/2c²))
-         where Rb = lambda1/lambda2  (blob vs line measure)
-               S  = sqrt(lambda1²+lambda2²)  (background measure)
-               c  = half the max S (auto gamma)
-    Responses across scales are max-pooled.
+    Better suited than Sato for NIR palm veins:
+    - Responds to weak, thin veins
+    - Less sensitive to bones / palm curvature
+    - More stable on grayscale images
+
+    Args:
+        img           : uint8 grayscale image
+        scale_min     : minimum vein scale (pixels)
+        scale_max     : maximum vein scale (pixels)
+        scale_step    : scale step
+        black_ridges  : True for dark veins on bright skin
+
+    Returns:
+        result : uint8 enhanced image (veins bright)
     """
-    from scipy.ndimage import gaussian_filter
+    import numpy as np
+    from skimage.filters import sato
 
-    vesselness = np.zeros_like(img_float)
+    img_f = img.astype(np.float32) / 255.0
 
-    for sigma in sigmas:
-        # Gaussian-smoothed second derivatives (Hessian elements)
-        # Uses sigma² scaling so responses are scale-invariant
-        scale = sigma ** 2
-        Dxx = gaussian_filter(img_float, sigma, order=(2, 0)) * scale
-        Dyy = gaussian_filter(img_float, sigma, order=(0, 2)) * scale
-        Dxy = gaussian_filter(img_float, sigma, order=(1, 1)) * scale
+    sigmas = list(range(scale_min, scale_max + 1, scale_step))
 
-        if black_ridges:
-            Dxx, Dyy, Dxy = -Dxx, -Dyy, -Dxy
+    print(f"  Running Sato filter  scales={sigmas}  black_ridges={black_ridges}")
 
-        # Eigenvalues of the 2×2 symmetric Hessian at each pixel
-        # lambda = (Dxx+Dyy)/2 ± sqrt(((Dxx-Dyy)/2)² + Dxy²)
-        tmp   = np.sqrt(((Dxx - Dyy) / 2) ** 2 + Dxy ** 2)
-        lam1  = (Dxx + Dyy) / 2 - tmp   # smaller eigenvalue
-        lam2  = (Dxx + Dyy) / 2 + tmp   # larger eigenvalue
+    ves = sato(
+        img_f,
+        sigmas=sigmas,
+        black_ridges=black_ridges
+    )
 
-        # Only pixels where lambda2 > 0 are vessel-like (bright ridge)
-        vessel_mask = lam2 > 0
-
-        # Rb: anisotropy (line vs blob), S: magnitude
-        Rb = np.where(vessel_mask, np.abs(lam1) / (np.abs(lam2) + 1e-10), 0.0)
-        S  = np.sqrt(lam1 ** 2 + lam2 ** 2)
-
-        # Auto gamma: half the max structure magnitude at this scale
-        c  = 0.5 * S.max() + 1e-10
-
-        V  = np.exp(-(Rb ** 2) / (2 * beta ** 2)) * \
-             (1.0 - np.exp(-(S ** 2) / (2 * c ** 2)))
-        V[~vessel_mask] = 0.0
-
-        vesselness = np.maximum(vesselness, V)
-
-    return vesselness
-
-
-def apply_frangi_filter(img, scale_min=1, scale_max=10, scale_step=1,
-                        alpha=0.5, beta=0.5, black_ridges=True):
-    """
-    Apply Frangi vesselness filter using a pure NumPy/SciPy implementation.
-
-    Avoids all scikit-image compiled extensions — works on any platform
-    including Windows environments where DLL loading may fail.
-
-    For NIR dorsal-hand images the veins appear as dark ridges on a brighter
-    skin background after CLAHE enhancement, so black_ridges=True is correct.
-    """
-    t0     = time.time()
-    img_f  = img.astype(np.float32) / 255.0
-    sigmas = np.arange(scale_min, scale_max + scale_step, scale_step)
-
-    print(f"  Running Frangi (pure NumPy/SciPy, no DLL required)")
-    print(f"  Scales {scale_min}-{scale_max} step {scale_step}  "
-          f"alpha={alpha}  beta={beta}  black_ridges={black_ridges}")
-
-    ves    = _frangi_pure(img_f, sigmas, alpha=alpha, beta=beta,
-                         black_ridges=black_ridges)
-    ves    = (ves - ves.min()) / (ves.max() - ves.min() + 1e-10)
+    # Normalize to [0, 255]
+    ves = (ves - ves.min()) / (ves.max() - ves.min() + 1e-10)
     result = (ves * 255).astype(np.uint8)
 
-    print(f"  Frangi done in {time.time()-t0:.3f}s")
     return result
-
 
 def resize_image(img, target_size=224):
     """Resize to CNN input size."""
@@ -642,7 +633,7 @@ def visualize_pipeline(stages):
         stages: list of (image_array, title_string) tuples.
     """
     n     = len(stages)
-    ncols = 5
+    ncols = 6
     nrows = (n + ncols - 1) // ncols
 
     fig, axes = plt.subplots(nrows, ncols,
@@ -688,8 +679,8 @@ if __name__ == "__main__":
     print(f"  WRIST_JUNCTION_RISE  = {WRIST_JUNCTION_RISE}")
     print(f"  MCP_SAFETY_MARGIN    = {MCP_SAFETY_MARGIN}")
     print(f"  MCP_DEFECT_DEPTH_MIN = {MCP_DEFECT_DEPTH_MIN}px")
-    print(f"  FRANGI scales        = {FRANGI_SCALE_MIN}-{FRANGI_SCALE_MAX} "
-          f"step {FRANGI_SCALE_STEP}")
+    print(f"  Sato scales        = {Sato_SCALE_MIN}-{Sato_SCALE_MAX} "
+          f"step {Sato_SCALE_STEP}")
     print(f"  CLAHE pre/post clip  = {CLAHE_PRE_CLIP} / {CLAHE_POST_CLIP}")
     print("=" * 60)
 
@@ -729,24 +720,22 @@ if __name__ == "__main__":
     img_clahe_pre = apply_clahe(img_segmented,
                                 clip_limit=CLAHE_PRE_CLIP,
                                 tile_size=CLAHE_TILE_SIZE,
-                                label="pre-Frangi")
+                                label="pre-Sato")
 
-    print("\n[Step 8] Frangi Filter")
-    img_frangi = apply_frangi_filter(
+    print("\n[Step 8] Sato Filter")
+    img_Sato = apply_sato_filter(
         img_clahe_pre,
-        scale_min=FRANGI_SCALE_MIN,
-        scale_max=FRANGI_SCALE_MAX,
-        scale_step=FRANGI_SCALE_STEP,
-        alpha=FRANGI_ALPHA,
-        beta=FRANGI_BETA,
+        scale_min=Sato_SCALE_MIN,
+        scale_max=Sato_SCALE_MAX,
+        scale_step=Sato_SCALE_STEP,
         black_ridges=True,
     )
 
     print("\n[Step 9] CLAHE Post-Enhancement")
-    img_clahe_post = apply_clahe(img_frangi,
+    img_clahe_post = apply_clahe(img_Sato,
                                  clip_limit=CLAHE_POST_CLIP,
                                  tile_size=CLAHE_TILE_SIZE,
-                                 label="post-Frangi")
+                                 label="post-Sato")
 
     print("\n[Step 10] Resize")
     img_resized = resize_image(img_clahe_post, target_size=224)
@@ -776,9 +765,9 @@ if __name__ == "__main__":
         (img_metacarpal, "5. Fingers Removed (MCP)"),
         (mask,           "6. Otsu Mask"),
         (img_segmented,  "7. Segmented"),
-        (img_clahe_pre,  "8. CLAHE Pre-Frangi"),
-        (img_frangi,     "9. Frangi Filter"),
-        (img_clahe_post, "10. CLAHE Post-Frangi"),
+        (img_clahe_pre,  "8. CLAHE Pre-Sato"),
+        (img_Sato,     "9. Sato Filter"),
+        (img_clahe_post, "10. CLAHE Post-Sato"),
         (img_resized,    "11. Resized 224x224"),
         (img_save,       "12. Normalized (display)"),
     ]
