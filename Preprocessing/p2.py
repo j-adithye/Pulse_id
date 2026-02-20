@@ -31,7 +31,7 @@ from scipy.ndimage import uniform_filter1d
 #  CONFIGURATION  -- edit these values to tune the pipeline
 # ==============================================================================
 
-IMAGE_PATH  = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\dataset\\person309\\vein_1.jpg"
+IMAGE_PATH  = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\dataset\\person9\\vein_1.jpg"
 OUTPUT_PATH = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\image\\vein_processed.jpg"
 
 # -- Otsu threshold offset -----------------------------------------------------
