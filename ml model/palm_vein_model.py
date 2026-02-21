@@ -1,27 +1,37 @@
 #!/usr/bin/env python3
 """
-Palm Vein Recognition - CNN + Siamese Network Training
-=======================================================
-Dataset structure:
-    dataset/
-    ├── person1/   (10 images)
-    ├── person2/   (10 images)
-    ...
-    └── person400/ (10 images)
+ml_model/model.py
+=================
+Siamese CNN training for palm vein recognition.
 
-Pipeline:
-    - Loads pairs on the fly with augmentation
-    - Trains CNN backbone using Siamese + Contrastive Loss
-    - Saves CNN-only model for deployment
+Reads from:   ../processed_dataset/   (output of preprocessing/preprocessing.py)
+Writes to:    ../output/
+    cnn_backbone.h5             full Keras model  (for debugging / resuming)
+    cnn_backbone.tflite         int8-quantized    (deploy this on Raspberry Pi)
+    deployment_config.json      threshold + metadata consumed by auth
+    training_curves.png
 
-Requirements:
-    pip install tensorflow numpy opencv-python scikit-learn matplotlib
+The images in processed_dataset/ are already uint8 PNGs (224x224 grayscale)
+produced by the full preprocessing pipeline (blur → crop → wrist removal →
+finger removal → segmentation → CLAHE → Sato → CLAHE → resize → z-score,
+then rescaled back to 0-255 for storage).
+
+So load_image() here just reads the PNG and divides by 255 — no
+re-preprocessing, no pipeline calls.
+
+Augmentation (rotation, translation, brightness, contrast, noise) is applied
+on-the-fly during training only, imported from augmentation.py in this folder.
 """
 
 import os
+import sys
+import json
 import random
+import argparse
 import numpy as np
 import cv2
+import matplotlib
+matplotlib.use("Agg")   # headless — safe for Pi and remote training servers
 import matplotlib.pyplot as plt
 from itertools import combinations
 
@@ -29,7 +39,23 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model, Input
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
-from sklearn.model_selection import train_test_split
+
+# augmentation.py lives in the same folder as this file
+sys.path.insert(0, os.path.dirname(__file__))
+from augmentation import augment_image
+
+
+# ─────────────────────────────────────────────
+#  PATHS
+#  Anchored to this file's location so the script works regardless of
+#  where it's called from.
+# ─────────────────────────────────────────────
+
+_HERE         = os.path.dirname(os.path.abspath(__file__))
+_ROOT         = os.path.dirname(_HERE)
+
+PROCESSED_DIR = os.path.join(_ROOT, "processed_dataset")
+OUTPUT_DIR    = os.path.join(_ROOT, "output")
 
 
 # ─────────────────────────────────────────────
@@ -38,412 +64,477 @@ from sklearn.model_selection import train_test_split
 
 CONFIG = {
     # Paths
-    "dataset_dir":   "dataset",
-    "output_dir":    "output",
-    "backbone_path": "output/cnn_backbone.h5",   # saved after training (deployment model)
-    "siamese_path":  "output/siamese_full.h5",   # full siamese (for resuming training)
+    "processed_dir": PROCESSED_DIR,
+    "output_dir":    OUTPUT_DIR,
+    "backbone_path": os.path.join(OUTPUT_DIR, "cnn_backbone.h5"),
+    "siamese_path":  os.path.join(OUTPUT_DIR, "siamese_checkpoint.h5"),
+    "tflite_path":   os.path.join(OUTPUT_DIR, "cnn_backbone.tflite"),
+    "deploy_config": os.path.join(OUTPUT_DIR, "deployment_config.json"),
+    "plot_path":     os.path.join(OUTPUT_DIR, "training_curves.png"),
 
-    # Image
-    "img_size":      224,       # final input size (matches your preprocessing output)
-    "channels":      1,         # grayscale
+    # Image — must match what preprocessing.py outputs
+    "img_size":      224,
+    "channels":      1,
 
     # Embedding
-    "embedding_dim": 128,       # size of final feature vector
+    "embedding_dim": 128,
 
-    # Dataset split (at CLASS level)
-    "train_ratio":   0.80,      # 320 classes
-    "val_ratio":     0.10,      # 40 classes
-    "test_ratio":    0.10,      # 40 classes
+    # Class-level split (no identity appears in more than one split)
+    "train_ratio":   0.80,
+    "val_ratio":     0.10,
+    # test gets the remainder
 
     # Pair generation
-    "neg_pos_ratio": 3,         # negative pairs per positive pair (balance)
+    # 3:1 neg:pos for training (harder negative exposure)
+    # 1:1 for val/test (unbiased accuracy metric)
+    "train_neg_ratio": 3,
+    "eval_neg_ratio":  1,
 
     # Training
     "batch_size":    32,
     "epochs":        50,
     "learning_rate": 1e-4,
-    "margin":        1.0,       # contrastive loss margin
-
-    # Augmentation (safe ranges for vein images)
-    "aug_rotation":     12,     # degrees ± 
-    "aug_translate":    0.07,   # fraction of image size ±
-    "aug_brightness":   0.15,   # ±
-    "aug_contrast":     0.15,   # ±
-    "aug_noise_std":    8,      # gaussian noise std (pixel values 0-255)
-    "aug_flip":         True,   # horizontal flip
+    "margin":        1.0,
 }
 
 os.makedirs(CONFIG["output_dir"], exist_ok=True)
 
 
 # ─────────────────────────────────────────────
-#  AUGMENTATION  (applied on-the-fly, training only)
+#  DATASET
 # ─────────────────────────────────────────────
 
-def augment_image(img):
+def load_dataset(processed_dir: str) -> dict:
     """
-    Apply safe augmentations that preserve vein structure.
-    Input/output: float32 array, shape (H, W) or (H, W, 1), range [0, 1]
-    """
-    # Work in HxW float32
-    if img.ndim == 3:
-        img = img[:, :, 0]
+    Scan processed_dataset/ and return:
+        { identity_name: [list of image paths] }
 
-    h, w = img.shape
-
-    # 1. Random horizontal flip
-    if CONFIG["aug_flip"] and random.random() < 0.5:
-        img = np.fliplr(img)
-
-    # 2. Small rotation (±12°)
-    angle = random.uniform(-CONFIG["aug_rotation"], CONFIG["aug_rotation"])
-    M_rot = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    img = cv2.warpAffine(img, M_rot, (w, h),
-                         flags=cv2.INTER_LINEAR,
-                         borderMode=cv2.BORDER_REFLECT_101)
-
-    # 3. Small translation (±7%)
-    tx = random.uniform(-CONFIG["aug_translate"], CONFIG["aug_translate"]) * w
-    ty = random.uniform(-CONFIG["aug_translate"], CONFIG["aug_translate"]) * h
-    M_trans = np.float32([[1, 0, tx], [0, 1, ty]])
-    img = cv2.warpAffine(img, M_trans, (w, h),
-                         borderMode=cv2.BORDER_REFLECT_101)
-
-    # 4. Brightness adjustment (±15%)
-    delta = random.uniform(-CONFIG["aug_brightness"], CONFIG["aug_brightness"])
-    img = np.clip(img + delta, 0.0, 1.0)
-
-    # 5. Contrast adjustment (±15%)
-    factor = 1.0 + random.uniform(-CONFIG["aug_contrast"], CONFIG["aug_contrast"])
-    mean = np.mean(img)
-    img = np.clip((img - mean) * factor + mean, 0.0, 1.0)
-
-    # 6. Mild Gaussian noise
-    noise = np.random.normal(0, CONFIG["aug_noise_std"] / 255.0, img.shape).astype(np.float32)
-    img = np.clip(img + noise, 0.0, 1.0)
-
-    return img[:, :, np.newaxis]   # return (H, W, 1)
-
-
-# ─────────────────────────────────────────────
-#  DATASET LOADER
-# ─────────────────────────────────────────────
-
-def load_dataset(dataset_dir):
-    """
-    Scan dataset folder and return a dict:
-        { class_name: [list of image paths] }
+    Expects the same folder layout as the raw dataset/:
+        processed_dataset/
+        ├── person_001/
+        │   ├── vein_1.png
+        │   └── ...
+        └── person_N/
     """
     class_map = {}
-    for person in sorted(os.listdir(dataset_dir)):
-        person_dir = os.path.join(dataset_dir, person)
+    for person in sorted(os.listdir(processed_dir)):
+        person_dir = os.path.join(processed_dir, person)
         if not os.path.isdir(person_dir):
             continue
         images = [
             os.path.join(person_dir, f)
             for f in sorted(os.listdir(person_dir))
-            if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+            if f.lower().endswith((".png", ".jpg", ".jpeg"))
         ]
-        if len(images) >= 2:   # need at least 2 for a positive pair
+        if len(images) >= 2:
             class_map[person] = images
 
-    print(f"✓ Loaded {len(class_map)} classes")
-    total_images = sum(len(v) for v in class_map.values())
-    print(f"✓ Total images: {total_images}")
+    total = sum(len(v) for v in class_map.values())
+    print(f"✓ Dataset loaded — {len(class_map)} identities, {total} images")
     return class_map
 
 
-def split_classes(class_map):
-    """Split classes into train / val / test (NO class overlap)"""
+def split_classes(class_map: dict) -> tuple:
+    """
+    Random identity-level split into train / val / test.
+    No identity appears in more than one split — this forces the network
+    to generalise to completely unseen people rather than memorise them.
+    """
     classes = list(class_map.keys())
     random.shuffle(classes)
 
-    n = len(classes)
+    n       = len(classes)
     n_train = int(n * CONFIG["train_ratio"])
     n_val   = int(n * CONFIG["val_ratio"])
 
-    train_classes = classes[:n_train]
-    val_classes   = classes[n_train:n_train + n_val]
-    test_classes  = classes[n_train + n_val:]
+    train_cls = classes[:n_train]
+    val_cls   = classes[n_train : n_train + n_val]
+    test_cls  = classes[n_train + n_val :]
 
-    print(f"✓ Split — Train: {len(train_classes)} | Val: {len(val_classes)} | Test: {len(test_classes)} classes")
+    print(f"  Split → train: {len(train_cls)}  val: {len(val_cls)}  test: {len(test_cls)} identities")
     return (
-        {c: class_map[c] for c in train_classes},
-        {c: class_map[c] for c in val_classes},
-        {c: class_map[c] for c in test_classes},
+        {c: class_map[c] for c in train_cls},
+        {c: class_map[c] for c in val_cls},
+        {c: class_map[c] for c in test_cls},
     )
 
 
-def generate_pairs(class_map, neg_pos_ratio=None):
-    """
-    Generate (path_a, path_b, label) pairs.
-        label = 0 → same person (positive)
-        label = 1 → different person (negative)
-    """
-    if neg_pos_ratio is None:
-        neg_pos_ratio = CONFIG["neg_pos_ratio"]
+# ─────────────────────────────────────────────
+#  PAIR GENERATION
+# ─────────────────────────────────────────────
 
-    positive_pairs = []
+def generate_pairs(class_map: dict, neg_ratio: int) -> list:
+    """
+    Build (path_a, path_b, label) tuples.
+        label = 0  →  same identity  (minimize distance)
+        label = 1  →  different      (maximize distance up to margin)
+
+    Negatives are sampled without replacement via a seen-set to prevent
+    duplicate pairs from distorting the training signal.
+    """
+    positives = []
     for paths in class_map.values():
         for a, b in combinations(paths, 2):
-            positive_pairs.append((a, b, 0))
+            positives.append((a, b, 0))
 
-    # Sample negatives
     class_list = list(class_map.keys())
-    negative_pairs = []
-    n_neg = len(positive_pairs) * neg_pos_ratio
-    while len(negative_pairs) < n_neg:
+    target     = len(positives) * neg_ratio
+    seen       = set()
+    negatives  = []
+
+    for _ in range(target * 10):   # 10× budget to find unique pairs
+        if len(negatives) >= target:
+            break
         c1, c2 = random.sample(class_list, 2)
         a = random.choice(class_map[c1])
         b = random.choice(class_map[c2])
-        negative_pairs.append((a, b, 1))
+        key = (min(a, b), max(a, b))
+        if key not in seen:
+            seen.add(key)
+            negatives.append((a, b, 1))
 
-    all_pairs = positive_pairs + negative_pairs
-    random.shuffle(all_pairs)
+    if len(negatives) < target:
+        print(f"  ⚠  Generated {len(negatives)}/{target} unique negatives")
 
-    print(f"✓ Pairs — Positive: {len(positive_pairs)} | Negative: {len(negative_pairs)} | Total: {len(all_pairs)}")
-    return all_pairs
-
-
-def load_image(path):
-    """Load and normalize a single image → float32 (H, W, 1) in [0,1]"""
-    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise ValueError(f"Cannot load image: {path}")
-    img = cv2.resize(img, (CONFIG["img_size"], CONFIG["img_size"]))
-    img = img.astype(np.float32) / 255.0
-    return img[:, :, np.newaxis]   # (H, W, 1)
+    pairs = positives + negatives
+    random.shuffle(pairs)
+    print(f"  Pairs → pos: {len(positives)}  neg: {len(negatives)}  total: {len(pairs)}")
+    return pairs
 
 
 # ─────────────────────────────────────────────
-#  DATA GENERATOR  (pairs + on-the-fly augmentation)
+#  IMAGE LOADING
+# ─────────────────────────────────────────────
+
+def load_image(path: str) -> np.ndarray:
+    """
+    Load a preprocessed image from processed_dataset/.
+
+    preprocessing.py outputs z-score normalized values, then rescales them
+    back to uint8 [0, 255] for storage:
+        saved = (normalized - min) / (max - min) * 255
+
+    Dividing by 255 here restores a clean float32 [0, 1] image.
+    The vein structure (enhanced by CLAHE + Sato) is fully preserved.
+
+    Returns: float32 (H, W, 1)
+    """
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError(f"Cannot load image: {path}")
+
+    # Safety resize — only triggers if img_size was changed after preprocessing
+    sz = CONFIG["img_size"]
+    if img.shape[0] != sz or img.shape[1] != sz:
+        img = cv2.resize(img, (sz, sz), interpolation=cv2.INTER_CUBIC)
+
+    return (img.astype(np.float32) / 255.0)[:, :, np.newaxis]   # (H, W, 1)
+
+
+# ─────────────────────────────────────────────
+#  DATA GENERATOR
 # ─────────────────────────────────────────────
 
 class PairGenerator(tf.keras.utils.Sequence):
     """
-    Keras Sequence that yields batches of image pairs on the fly.
-    Augmentation is applied only when augment=True (training set).
+    Yields batches of image pairs on the fly.
+    augment=True  →  stochastic augmentation via augmentation.py (training only)
+    augment=False →  deterministic (val, test, threshold calibration)
     """
 
-    def __init__(self, pairs, batch_size, augment=False):
+    def __init__(self, pairs: list, batch_size: int, augment: bool = False):
         self.pairs      = pairs
         self.batch_size = batch_size
         self.augment    = augment
         self.indices    = np.arange(len(pairs))
 
-    def __len__(self):
+    def __len__(self) -> int:
         return int(np.ceil(len(self.pairs) / self.batch_size))
 
     def on_epoch_end(self):
-        """Shuffle pairs after each epoch"""
         np.random.shuffle(self.indices)
 
-    def __getitem__(self, idx):
-        batch_indices = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
-        batch_pairs   = [self.pairs[i] for i in batch_indices]
+    def __getitem__(self, idx: int):
+        batch = [
+            self.pairs[i]
+            for i in self.indices[idx * self.batch_size : (idx + 1) * self.batch_size]
+        ]
 
-        img_size = CONFIG["img_size"]
-        ch       = CONFIG["channels"]
+        sz = CONFIG["img_size"]
+        ch = CONFIG["channels"]
+        A  = np.zeros((len(batch), sz, sz, ch), dtype=np.float32)
+        B  = np.zeros((len(batch), sz, sz, ch), dtype=np.float32)
+        L  = np.zeros((len(batch),),            dtype=np.float32)
 
-        batch_a = np.zeros((len(batch_pairs), img_size, img_size, ch), dtype=np.float32)
-        batch_b = np.zeros((len(batch_pairs), img_size, img_size, ch), dtype=np.float32)
-        labels  = np.zeros((len(batch_pairs),), dtype=np.float32)
-
-        for i, (path_a, path_b, label) in enumerate(batch_pairs):
-            img_a = load_image(path_a)
-            img_b = load_image(path_b)
-
+        for i, (pa, pb, label) in enumerate(batch):
+            ia = load_image(pa)
+            ib = load_image(pb)
             if self.augment:
-                img_a = augment_image(img_a)
-                img_b = augment_image(img_b)
+                ia = augment_image(ia)
+                ib = augment_image(ib)
+            A[i] = ia
+            B[i] = ib
+            L[i] = label
 
-            batch_a[i] = img_a
-            batch_b[i] = img_b
-            labels[i]  = label
-
-        return [batch_a, batch_b], labels
+        return [A, B], L
 
 
 # ─────────────────────────────────────────────
-#  CNN BACKBONE  (lightweight for Raspberry Pi)
+#  CNN BACKBONE
 # ─────────────────────────────────────────────
 
-def build_cnn_backbone(input_shape, embedding_dim):
+def build_backbone(img_size: int, channels: int, embedding_dim: int) -> Model:
     """
-    Lightweight CNN backbone suitable for Raspberry Pi 4.
-    Input:  (224, 224, 1)
-    Output: L2-normalized embedding vector of size embedding_dim
+    4-block CNN → GlobalAveragePooling → Dense head → L2-normalized embedding.
+
+    Raspberry Pi 4 notes:
+      - GlobalAveragePooling not Flatten: far fewer parameters, less RAM.
+      - int8 TFLite export (done after training) gives ~4× speedup on ARMv8.
+      - If inference is still too slow, drop img_size from 224 to 128 in CONFIG
+        and re-run preprocessing with target_size=128 — no code changes needed.
     """
-    inputs = Input(shape=input_shape, name="input")
+    inputs = Input(shape=(img_size, img_size, channels), name="input")
 
     # Block 1
-    x = layers.Conv2D(32, (3, 3), padding="same", name="conv1_1")(inputs)
+    x = layers.Conv2D(32, 3, padding="same", name="conv1_1")(inputs)
     x = layers.BatchNormalization(name="bn1_1")(x)
     x = layers.ReLU(name="relu1_1")(x)
-    x = layers.Conv2D(32, (3, 3), padding="same", name="conv1_2")(x)
+    x = layers.Conv2D(32, 3, padding="same", name="conv1_2")(x)
     x = layers.BatchNormalization(name="bn1_2")(x)
     x = layers.ReLU(name="relu1_2")(x)
-    x = layers.MaxPooling2D((2, 2), name="pool1")(x)    # → 112×112×32
+    x = layers.MaxPooling2D(2, name="pool1")(x)
     x = layers.Dropout(0.25, name="drop1")(x)
 
     # Block 2
-    x = layers.Conv2D(64, (3, 3), padding="same", name="conv2_1")(x)
+    x = layers.Conv2D(64, 3, padding="same", name="conv2_1")(x)
     x = layers.BatchNormalization(name="bn2_1")(x)
     x = layers.ReLU(name="relu2_1")(x)
-    x = layers.Conv2D(64, (3, 3), padding="same", name="conv2_2")(x)
+    x = layers.Conv2D(64, 3, padding="same", name="conv2_2")(x)
     x = layers.BatchNormalization(name="bn2_2")(x)
     x = layers.ReLU(name="relu2_2")(x)
-    x = layers.MaxPooling2D((2, 2), name="pool2")(x)    # → 56×56×64
+    x = layers.MaxPooling2D(2, name="pool2")(x)
     x = layers.Dropout(0.25, name="drop2")(x)
 
     # Block 3
-    x = layers.Conv2D(128, (3, 3), padding="same", name="conv3_1")(x)
+    x = layers.Conv2D(128, 3, padding="same", name="conv3_1")(x)
     x = layers.BatchNormalization(name="bn3_1")(x)
     x = layers.ReLU(name="relu3_1")(x)
-    x = layers.Conv2D(128, (3, 3), padding="same", name="conv3_2")(x)
+    x = layers.Conv2D(128, 3, padding="same", name="conv3_2")(x)
     x = layers.BatchNormalization(name="bn3_2")(x)
     x = layers.ReLU(name="relu3_2")(x)
-    x = layers.MaxPooling2D((2, 2), name="pool3")(x)    # → 28×28×128
+    x = layers.MaxPooling2D(2, name="pool3")(x)
     x = layers.Dropout(0.25, name="drop3")(x)
 
     # Block 4
-    x = layers.Conv2D(256, (3, 3), padding="same", name="conv4_1")(x)
+    x = layers.Conv2D(256, 3, padding="same", name="conv4_1")(x)
     x = layers.BatchNormalization(name="bn4_1")(x)
     x = layers.ReLU(name="relu4_1")(x)
-    x = layers.MaxPooling2D((2, 2), name="pool4")(x)    # → 14×14×256
+    x = layers.MaxPooling2D(2, name="pool4")(x)
     x = layers.Dropout(0.25, name="drop4")(x)
 
-    # Global Average Pooling (much lighter than Flatten for Pi deployment)
-    x = layers.GlobalAveragePooling2D(name="gap")(x)    # → 256
-
-    # Embedding head
+    # Pooling + embedding head
+    x = layers.GlobalAveragePooling2D(name="gap")(x)
     x = layers.Dense(256, name="dense1")(x)
     x = layers.BatchNormalization(name="bn_dense")(x)
     x = layers.ReLU(name="relu_dense")(x)
     x = layers.Dropout(0.3, name="drop_dense")(x)
     x = layers.Dense(embedding_dim, name="embedding")(x)
 
-    # L2 normalize → all vectors live on unit hypersphere
-    # cosine similarity then = dot product
+    # L2 normalize → unit hypersphere, cosine similarity == dot product
     outputs = layers.Lambda(
         lambda t: tf.math.l2_normalize(t, axis=1),
         name="l2_norm"
     )(x)
 
-    backbone = Model(inputs, outputs, name="cnn_backbone")
-    return backbone
+    return Model(inputs, outputs, name="cnn_backbone")
 
 
 # ─────────────────────────────────────────────
-#  SIAMESE NETWORK  (training only)
+#  SIAMESE WRAPPER  (training only)
 # ─────────────────────────────────────────────
 
-def build_siamese_network(backbone):
-    """
-    Wrap backbone in Siamese structure for training.
-    Takes two images, returns euclidean distance between embeddings.
-    """
-    img_size = CONFIG["img_size"]
-    ch       = CONFIG["channels"]
-    shape    = (img_size, img_size, ch)
+def build_siamese(backbone: Model) -> Model:
+    """Wrap backbone for pair-wise training. Only the backbone is deployed."""
+    shape = (CONFIG["img_size"], CONFIG["img_size"], CONFIG["channels"])
+    in_a  = Input(shape=shape, name="input_a")
+    in_b  = Input(shape=shape, name="input_b")
 
-    input_a = Input(shape=shape, name="input_a")
-    input_b = Input(shape=shape, name="input_b")
+    emb_a = backbone(in_a, training=True)
+    emb_b = backbone(in_b, training=True)
 
-    # Shared backbone (same weights)
-    embedding_a = backbone(input_a)
-    embedding_b = backbone(input_b)
+    dist = layers.Lambda(
+        lambda t: tf.norm(t[0] - t[1], axis=1, keepdims=True),
+        name="euclidean_dist"
+    )([emb_a, emb_b])
 
-    # Euclidean distance between embeddings
-    distance = layers.Lambda(
-        lambda tensors: tf.norm(tensors[0] - tensors[1], axis=1, keepdims=True),
-        name="euclidean_distance"
-    )([embedding_a, embedding_b])
-
-    siamese = Model(inputs=[input_a, input_b], outputs=distance, name="siamese_network")
-    return siamese
+    return Model(inputs=[in_a, in_b], outputs=dist, name="siamese")
 
 
 # ─────────────────────────────────────────────
 #  CONTRASTIVE LOSS
 # ─────────────────────────────────────────────
 
-def contrastive_loss(margin=1.0):
+def contrastive_loss(margin: float = 1.0):
     """
-    Contrastive loss function.
-        label = 0 → same person  → minimize distance
-        label = 1 → diff person  → maximize distance (up to margin)
-
-    Loss = (1-y) * D² + y * max(margin - D, 0)²
+    L = (1-y)·d²  +  y·max(margin-d, 0)²
+    y=0 → same person → push d toward 0
+    y=1 → different   → push d beyond margin
     """
     def loss(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        d      = tf.squeeze(y_pred, axis=1)
-        pos    = (1.0 - y_true) * tf.square(d)
-        neg    = y_true * tf.square(tf.maximum(margin - d, 0.0))
-        return tf.reduce_mean(pos + neg)
+        y = tf.cast(y_true, tf.float32)
+        d = tf.squeeze(y_pred, axis=1)
+        return tf.reduce_mean(
+            (1.0 - y) * tf.square(d)
+            + y * tf.square(tf.maximum(margin - d, 0.0))
+        )
     return loss
 
 
 # ─────────────────────────────────────────────
-#  METRICS  (accuracy at optimal threshold)
+#  EVALUATION HELPERS
 # ─────────────────────────────────────────────
 
-def compute_accuracy(distances, labels, threshold=0.5):
-    """Compute accuracy given distances and labels at a threshold"""
-    predictions = (distances < threshold).astype(int)   # < threshold → same person
-    true_labels = (1 - labels).astype(int)              # label 0 = same → positive
-    return np.mean(predictions == true_labels)
+def get_distances(backbone: Model, generator: PairGenerator) -> tuple:
+    """Run backbone (inference mode) over a generator, return distances + labels."""
+    all_dist, all_labels = [], []
+    for i in range(len(generator)):
+        [A, B], labels = generator[i]
+        emb_a = backbone(A, training=False).numpy()
+        emb_b = backbone(B, training=False).numpy()
+        all_dist.extend(np.linalg.norm(emb_a - emb_b, axis=1).tolist())
+        all_labels.extend(labels.tolist())
+    return np.array(all_dist), np.array(all_labels)
 
 
-def find_best_threshold(distances, labels, steps=100):
-    """Find threshold that maximizes accuracy on validation set"""
-    best_acc   = 0
-    best_thresh = 0
+def accuracy_at_threshold(dists: np.ndarray, labels: np.ndarray, t: float) -> float:
+    return float(np.mean((dists < t).astype(int) == (1 - labels).astype(int)))
+
+
+def find_best_threshold(dists: np.ndarray, labels: np.ndarray, steps: int = 200) -> tuple:
+    """Sweep distance thresholds, return the one with highest accuracy."""
+    best_t, best_acc = 0.0, 0.0
     for t in np.linspace(0, 2, steps):
-        acc = compute_accuracy(distances, labels, threshold=t)
+        acc = accuracy_at_threshold(dists, labels, t)
         if acc > best_acc:
-            best_acc    = acc
-            best_thresh = t
-    return best_thresh, best_acc
+            best_acc, best_t = acc, float(t)
+    return best_t, best_acc
 
 
 # ─────────────────────────────────────────────
-#  TRAINING
+#  TFLITE EXPORT
 # ─────────────────────────────────────────────
 
-def train(dataset_dir=None):
-    if dataset_dir is None:
-        dataset_dir = CONFIG["dataset_dir"]
+def export_tflite(backbone: Model, train_map: dict, tflite_path: str):
+    """
+    Convert the trained backbone to int8-quantized TFLite.
 
-    print("\n" + "="*60)
-    print("PALM VEIN CNN + SIAMESE TRAINING")
-    print("="*60)
+    Why int8:
+      - ~4× faster inference on ARMv8 (Raspberry Pi 4)
+      - ~4× smaller model file
+      - Minimal accuracy loss (<0.5% typical for this type of network)
 
-    # ── Load & split dataset ──
-    class_map = load_dataset(dataset_dir)
+    The representative_dataset feeds ~300 real training images to the
+    converter so it can calibrate the int8 activation ranges correctly.
+    Without this the converter falls back to float32, defeating the purpose.
+
+    IO tensors stay float32 — auth.py doesn't need to handle quantized IO.
+    """
+    print("\nExporting to TFLite (int8 quantization)...")
+
+    sample_paths = []
+    for paths in train_map.values():
+        sample_paths.extend(paths)
+    random.shuffle(sample_paths)
+    sample_paths = sample_paths[:300]
+
+    def representative_dataset():
+        for path in sample_paths:
+            img = load_image(path)                      # (H, W, 1) float32
+            yield [np.expand_dims(img, axis=0)]         # (1, H, W, 1)
+
+    converter = tf.lite.TFLiteConverter.from_keras_model(backbone)
+    converter.optimizations             = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset    = representative_dataset
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type      = tf.float32   # keep float IO
+    converter.inference_output_type     = tf.float32
+
+    tflite_model = converter.convert()
+
+    with open(tflite_path, "wb") as f:
+        f.write(tflite_model)
+
+    size_kb = os.path.getsize(tflite_path) / 1024
+    print(f"✓ TFLite model → {tflite_path}  ({size_kb:.0f} KB)")
+
+
+# ─────────────────────────────────────────────
+#  TRAINING CURVES
+# ─────────────────────────────────────────────
+
+def save_training_plot(history, path: str):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].plot(history.history["loss"],     label="Train")
+    axes[0].plot(history.history["val_loss"], label="Val")
+    axes[0].set_title("Contrastive Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].legend()
+    axes[0].grid(True)
+
+    if "lr" in history.history:
+        axes[1].plot(history.history["lr"], color="orange")
+        axes[1].set_title("Learning Rate")
+        axes[1].set_xlabel("Epoch")
+        axes[1].grid(True)
+    else:
+        axes[1].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close(fig)
+    print(f"✓ Training curves → {path}")
+
+
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
+
+def train(processed_dir: str = None):
+    if processed_dir is None:
+        processed_dir = CONFIG["processed_dir"]
+
+    print("\n" + "=" * 60)
+    print("PALM VEIN — SIAMESE CNN TRAINING")
+    print("=" * 60)
+    print(f"  Source : {processed_dir}")
+    print(f"  Output : {CONFIG['output_dir']}")
+    print(f"  Size   : {CONFIG['img_size']}×{CONFIG['img_size']}")
+    print(f"  Embed  : {CONFIG['embedding_dim']}-d")
+    print("=" * 60)
+
+    # ── Load & split ──
+    class_map = load_dataset(processed_dir)
     train_map, val_map, test_map = split_classes(class_map)
 
-    # ── Generate pairs ──
+    # ── Pairs ──
     print("\nGenerating pairs...")
-    train_pairs = generate_pairs(train_map)
-    val_pairs   = generate_pairs(val_map)
-    test_pairs  = generate_pairs(test_map)
+    train_pairs = generate_pairs(train_map, CONFIG["train_neg_ratio"])
+    val_pairs   = generate_pairs(val_map,   CONFIG["eval_neg_ratio"])
+    test_pairs  = generate_pairs(test_map,  CONFIG["eval_neg_ratio"])
 
-    # ── Data generators ──
+    # ── Generators ──
     train_gen = PairGenerator(train_pairs, CONFIG["batch_size"], augment=True)
     val_gen   = PairGenerator(val_pairs,   CONFIG["batch_size"], augment=False)
     test_gen  = PairGenerator(test_pairs,  CONFIG["batch_size"], augment=False)
 
-    # ── Build models ──
-    print("\nBuilding models...")
-    input_shape = (CONFIG["img_size"], CONFIG["img_size"], CONFIG["channels"])
-    backbone    = build_cnn_backbone(input_shape, CONFIG["embedding_dim"])
-    siamese     = build_siamese_network(backbone)
-
+    # ── Build ──
+    print("\nBuilding model...")
+    backbone = build_backbone(CONFIG["img_size"], CONFIG["channels"], CONFIG["embedding_dim"])
+    siamese  = build_siamese(backbone)
     backbone.summary()
 
-    # ── Compile ──
     siamese.compile(
         optimizer=Adam(learning_rate=CONFIG["learning_rate"]),
         loss=contrastive_loss(margin=CONFIG["margin"])
@@ -451,30 +542,16 @@ def train(dataset_dir=None):
 
     # ── Callbacks ──
     callbacks = [
-        ModelCheckpoint(
-            CONFIG["siamese_path"],
-            monitor="val_loss",
-            save_best_only=True,
-            verbose=1
-        ),
-        EarlyStopping(
-            monitor="val_loss",
-            patience=10,
-            restore_best_weights=True,
-            verbose=1
-        ),
-        ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=0.5,
-            patience=5,
-            min_lr=1e-6,
-            verbose=1
-        ),
+        ModelCheckpoint(CONFIG["siamese_path"], monitor="val_loss",
+                        save_best_only=True, verbose=1),
+        EarlyStopping(monitor="val_loss", patience=10,
+                      restore_best_weights=True, verbose=1),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                          patience=5, min_lr=1e-6, verbose=1),
     ]
 
     # ── Train ──
-    print("\nStarting training...")
-    print("="*60)
+    print("\nTraining...")
     history = siamese.fit(
         train_gen,
         validation_data=val_gen,
@@ -482,154 +559,61 @@ def train(dataset_dir=None):
         callbacks=callbacks,
     )
 
-    # ── Save CNN backbone only (deployment model) ──
+    # ── Save Keras backbone ──
     backbone.save(CONFIG["backbone_path"])
-    print(f"\n✓ CNN backbone saved → {CONFIG['backbone_path']}")
-    print("  (This is the model you deploy on Raspberry Pi)")
+    print(f"✓ Backbone (Keras) → {CONFIG['backbone_path']}")
 
-    # ── Evaluate on test set ──
-    print("\nEvaluating on test set...")
-    distances = []
-    labels    = []
-    for i in range(len(test_gen)):
-        [batch_a, batch_b], batch_labels = test_gen[i]
-        emb_a = backbone.predict(batch_a, verbose=0)
-        emb_b = backbone.predict(batch_b, verbose=0)
-        dist  = np.linalg.norm(emb_a - emb_b, axis=1)
-        distances.extend(dist.tolist())
-        labels.extend(batch_labels.tolist())
+    # ── Threshold: calibrate on VAL, report on TEST ──
+    # Calibrating on test would be data leakage — the threshold would be
+    # optimistically tuned to that specific split.
+    print("\nCalibrating threshold on validation set...")
+    val_dists, val_labels = get_distances(backbone, val_gen)
+    best_thresh, val_acc  = find_best_threshold(val_dists, val_labels)
+    print(f"  Val accuracy  : {val_acc * 100:.2f}%  at threshold = {best_thresh:.4f}")
 
-    distances = np.array(distances)
-    labels    = np.array(labels)
+    print("Evaluating on test set...")
+    test_dists, test_labels = get_distances(backbone, test_gen)
+    test_acc = accuracy_at_threshold(test_dists, test_labels, best_thresh)
+    print(f"  Test accuracy : {test_acc * 100:.2f}%  at threshold = {best_thresh:.4f}")
 
-    best_thresh, best_acc = find_best_threshold(distances, labels)
-    print(f"✓ Best threshold: {best_thresh:.4f}")
-    print(f"✓ Test accuracy:  {best_acc * 100:.2f}%")
+    # ── TFLite ──
+    export_tflite(backbone, train_map, CONFIG["tflite_path"])
 
-    # ── Plot training curves ──
-    plot_training(history)
+    # ── Deployment config ──
+    deploy_cfg = {
+        "tflite_path":   CONFIG["tflite_path"],
+        "backbone_path": CONFIG["backbone_path"],
+        "threshold":     best_thresh,
+        "embedding_dim": CONFIG["embedding_dim"],
+        "img_size":      CONFIG["img_size"],
+    }
+    with open(CONFIG["deploy_config"], "w") as f:
+        json.dump(deploy_cfg, f, indent=2)
+    print(f"✓ Deployment config → {CONFIG['deploy_config']}")
+
+    # ── Plot ──
+    save_training_plot(history, CONFIG["plot_path"])
 
     return backbone, history, best_thresh
 
 
 # ─────────────────────────────────────────────
-#  PLOT TRAINING CURVES
-# ─────────────────────────────────────────────
-
-def plot_training(history):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-    axes[0].plot(history.history["loss"],     label="Train Loss")
-    axes[0].plot(history.history["val_loss"], label="Val Loss")
-    axes[0].set_title("Contrastive Loss")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Loss")
-    axes[0].legend()
-    axes[0].grid(True)
-
-    # Learning rate (if ReduceLROnPlateau fired)
-    if "lr" in history.history:
-        axes[1].plot(history.history["lr"], color="orange")
-        axes[1].set_title("Learning Rate")
-        axes[1].set_xlabel("Epoch")
-        axes[1].set_ylabel("LR")
-        axes[1].grid(True)
-    else:
-        axes[1].axis("off")
-
-    plt.tight_layout()
-    plot_path = os.path.join(CONFIG["output_dir"], "training_curves.png")
-    plt.savefig(plot_path)
-    print(f"✓ Training curves saved → {plot_path}")
-    plt.show()
-
-
-# ─────────────────────────────────────────────
-#  INFERENCE UTILITIES  (enrollment + auth)
-# ─────────────────────────────────────────────
-
-def load_backbone(model_path=None):
-    """Load saved CNN backbone for deployment"""
-    if model_path is None:
-        model_path = CONFIG["backbone_path"]
-    backbone = tf.keras.models.load_model(model_path)
-    print(f"✓ Backbone loaded from {model_path}")
-    return backbone
-
-
-def enroll_user(backbone, image_paths):
-    """
-    Enroll a user by averaging embeddings from 5-10 images.
-    Returns a single representative template vector.
-    """
-    embeddings = []
-    for path in image_paths:
-        img = load_image(path)                      # (H, W, 1)
-        img = np.expand_dims(img, axis=0)           # (1, H, W, 1)
-        emb = backbone.predict(img, verbose=0)[0]   # (128,)
-        embeddings.append(emb)
-
-    template = np.mean(embeddings, axis=0)
-    template = template / (np.linalg.norm(template) + 1e-10)  # re-normalize
-    print(f"✓ Enrolled user with {len(image_paths)} images → template shape: {template.shape}")
-    return template
-
-
-def authenticate_user(backbone, query_image_path, stored_template, threshold=0.5):
-    """
-    Authenticate a user by comparing query image embedding
-    against stored template using cosine similarity.
-
-    Returns:
-        granted (bool), similarity score (float)
-    """
-    img = load_image(query_image_path)
-    img = np.expand_dims(img, axis=0)
-    query_emb = backbone.predict(img, verbose=0)[0]
-
-    # Cosine similarity (both vectors are L2 normalized → dot product = cosine similarity)
-    similarity = np.dot(query_emb, stored_template)
-
-    # Convert to euclidean distance equivalent for threshold comparison
-    # For L2-normalized vectors: euclidean_dist² = 2 * (1 - cosine_similarity)
-    distance = np.sqrt(2 * max(0, 1 - similarity))
-
-    granted = distance < threshold
-    status  = "GRANTED ✓" if granted else "DENIED ✗"
-
-    print(f"Authentication: {status}")
-    print(f"  Cosine similarity: {similarity:.4f}")
-    print(f"  Euclidean distance: {distance:.4f} (threshold: {threshold})")
-
-    return granted, similarity
-
-
-# ─────────────────────────────────────────────
-#  MAIN
+#  CLI
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train Palm Vein CNN")
+    parser.add_argument(
+        "--data", default=None,
+        help=f"Path to processed_dataset/  (default: {PROCESSED_DIR})"
+    )
+    args = parser.parse_args()
 
-    print("="*60)
-    print("PALM VEIN RECOGNITION — MODEL TRAINING")
-    print("="*60)
-    print(f"Dataset:       {CONFIG['dataset_dir']}")
-    print(f"Image size:    {CONFIG['img_size']}×{CONFIG['img_size']}")
-    print(f"Embedding dim: {CONFIG['embedding_dim']}")
-    print(f"Batch size:    {CONFIG['batch_size']}")
-    print(f"Max epochs:    {CONFIG['epochs']}")
-    print(f"Margin:        {CONFIG['margin']}")
-    print("="*60)
+    backbone, history, threshold = train(processed_dir=args.data)
 
-    backbone, history, best_threshold = train()
-
-    print("\n" + "="*60)
-    print("TRAINING COMPLETE")
-    print("="*60)
-    print(f"CNN backbone saved  → {CONFIG['backbone_path']}")
-    print(f"Best threshold      → {best_threshold:.4f}")
-    print("\nTo deploy on Raspberry Pi:")
-    print("  1. Copy cnn_backbone.h5 to your Pi")
-    print("  2. Use enroll_user() to register new users")
-    print("  3. Use authenticate_user() for authentication")
-    print("="*60)
+    print("\n" + "=" * 60)
+    print("DONE")
+    print(f"  TFLite model   → {CONFIG['tflite_path']}")
+    print(f"  Deployment cfg → {CONFIG['deploy_config']}")
+    print(f"  Threshold      → {threshold:.4f}")
+    print("=" * 60)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-converter.py  –  Batch preprocessing for the dorsal hand vein dataset.
+converter.py    Batch preprocessing for the dorsal hand vein dataset.
 
 Walks dataset/ (person1/ … person400/), runs the full preprocessing
 pipeline from preprocessing.py on every .jpg image, and saves the
@@ -17,6 +17,8 @@ import argparse
 import traceback
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import redirect_stdout
+from io import StringIO
 
 import cv2
 import numpy as np
@@ -49,6 +51,14 @@ def preprocess_single(src_path: Path, dst_path: Path) -> tuple[bool, str]:
 
     Returns (success: bool, message: str).
     """
+    try:
+        with redirect_stdout(StringIO()):  # silence all preprocessing.py prints
+            return _run_pipeline(src_path, dst_path)
+    except Exception:
+        return False, f"FAILED {src_path}:\n{traceback.format_exc()}"
+
+
+def _run_pipeline(src_path: Path, dst_path: Path) -> tuple[bool, None]:
     try:
         # Step 1 & 2 – Load + Gaussian Blur
         img = pp.load_image(str(src_path))
@@ -117,76 +127,73 @@ def preprocess_single(src_path: Path, dst_path: Path) -> tuple[bool, str]:
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(dst_path), img_save)
 
-        return True, f"OK  {src_path.name}"
+        return True, None
 
     except Exception:
-        return False, f"FAILED {src_path}:\n{traceback.format_exc()}"
+        return False, f"FAILED {src_path}:\n{traceback.format_exc()}" # type: ignore
 
 
-def collect_jobs(dataset_dir: Path, output_dir: Path) -> list[tuple[Path, Path]]:
-    """Return (src, dst) pairs for every .jpg found under dataset_dir."""
+def collect_jobs(dataset_dir: Path, output_dir: Path) -> tuple[list, int]:
+    """
+    Return ((src, dst, person_name) triples, total_person_count).
+    Groups images by person so we can track per-person progress.
+    """
     jobs = []
-    for person_dir in sorted(dataset_dir.iterdir()):
-        if not person_dir.is_dir():
-            continue
+    person_dirs = sorted(p for p in dataset_dir.iterdir() if p.is_dir())
+    for person_dir in person_dirs:
         for img_file in sorted(person_dir.glob("*.jpg")):
-            relative   = img_file.relative_to(dataset_dir)
-            dst_path   = output_dir / relative
-            jobs.append((img_file, dst_path))
-    return jobs
+            relative = img_file.relative_to(dataset_dir)
+            dst_path = output_dir / relative
+            jobs.append((img_file, dst_path, person_dir.name))
+    return jobs, len(person_dirs)
 
 
-def run(dataset_dir: Path, output_dir: Path, workers: int, quiet: bool) -> None:
-    jobs = collect_jobs(dataset_dir, output_dir)
-    total = len(jobs)
-    if total == 0:
+def run(dataset_dir: Path, output_dir: Path, workers: int) -> None:
+    jobs, total_persons = collect_jobs(dataset_dir, output_dir)
+    if not jobs:
         print("No .jpg images found – check the dataset path.")
         sys.exit(1)
 
-    print(f"Found {total} images across {len(list(dataset_dir.iterdir()))} persons.")
-    print(f"Output → {output_dir.resolve()}")
-    print(f"Workers: {workers}\n")
+    failures      = []
+    persons_done  = 0
+    person_img_ok = {}   # person_name -> images successfully done
+    person_img_total = {}
+    for _, _, pname in jobs:
+        person_img_total[pname] = person_img_total.get(pname, 0) + 1
 
-    ok_count = fail_count = 0
-    failures = []
+    def _print_progress():
+        print(f"\r{persons_done}/{total_persons}", end="", flush=True)
+
+    _print_progress()
+
+    def _handle(pname, success, msg):
+        nonlocal persons_done
+        if success:
+            person_img_ok[pname] = person_img_ok.get(pname, 0) + 1
+            if person_img_ok[pname] == person_img_total[pname]:
+                persons_done += 1
+                _print_progress()
+        else:
+            failures.append(msg)
 
     if workers == 1:
-        # Single-process – easier to debug
-        for i, (src, dst) in enumerate(jobs, 1):
+        for src, dst, pname in jobs:
             success, msg = preprocess_single(src, dst)
-            if success:
-                ok_count += 1
-                if not quiet:
-                    print(f"[{i:>5}/{total}] {msg}")
-            else:
-                fail_count += 1
-                failures.append(msg)
-                print(f"[{i:>5}/{total}] {msg}", file=sys.stderr)
+            _handle(pname, success, msg)
     else:
         with ProcessPoolExecutor(max_workers=workers) as pool:
-            future_map = {pool.submit(preprocess_single, src, dst): (i + 1, src)
-                          for i, (src, dst) in enumerate(jobs)}
+            future_map = {pool.submit(preprocess_single, src, dst): pname
+                          for src, dst, pname in jobs}
             for future in as_completed(future_map):
-                idx, src = future_map[future]
+                pname = future_map[future]
                 success, msg = future.result()
-                if success:
-                    ok_count += 1
-                    if not quiet:
-                        print(f"[{idx:>5}/{total}] {msg}")
-                else:
-                    fail_count += 1
-                    failures.append(msg)
-                    print(f"[{idx:>5}/{total}] {msg}", file=sys.stderr)
+                _handle(pname, success, msg)
 
-    # Summary
-    print("\n" + "=" * 60)
-    print(f"  Completed : {ok_count}/{total}")
-    print(f"  Failed    : {fail_count}")
+    print()  # newline after progress
     if failures:
-        print("\nFailed images:")
+        print(f"\nFailed ({len(failures)}):")
         for f in failures:
             print("  •", f.splitlines()[0])
-    print("=" * 60)
 
 
 # ---------------------------------------------------------------------------
@@ -206,12 +213,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--workers", type=int, default=1,
-        help="Number of parallel worker processes (default: 1). "
-             "Use >1 for faster bulk processing on multi-core machines."
-    )
-    parser.add_argument(
-        "--quiet", action="store_true",
-        help="Suppress per-image success messages."
+        help="Number of parallel worker processes (default: 1)."
     )
     args = parser.parse_args()
 
@@ -219,5 +221,4 @@ if __name__ == "__main__":
         dataset_dir=Path(args.dataset),
         output_dir=Path(args.output),
         workers=args.workers,
-        quiet=args.quiet,
     )
