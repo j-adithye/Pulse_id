@@ -42,7 +42,7 @@ from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLRO
 
 # augmentation.py lives in the same folder as this file
 sys.path.insert(0, os.path.dirname(__file__))
-from augmentation import augment_image
+from augmentation import augment_image # type: ignore
 
 
 # ─────────────────────────────────────────────
@@ -73,7 +73,7 @@ CONFIG = {
     "plot_path":     os.path.join(OUTPUT_DIR, "training_curves.png"),
 
     # Image — must match what preprocessing.py outputs
-    "img_size":      224,
+    "img_size":      128,
     "channels":      1,
 
     # Embedding
@@ -242,7 +242,8 @@ class PairGenerator(tf.keras.utils.Sequence):
     augment=False →  deterministic (val, test, threshold calibration)
     """
 
-    def __init__(self, pairs: list, batch_size: int, augment: bool = False):
+    def __init__(self, pairs: list, batch_size: int, augment: bool = False, **kwargs):
+        super().__init__(**kwargs)
         self.pairs      = pairs
         self.batch_size = batch_size
         self.augment    = augment
@@ -276,7 +277,7 @@ class PairGenerator(tf.keras.utils.Sequence):
             B[i] = ib
             L[i] = label
 
-        return [A, B], L
+        return (A, B), L
 
 
 # ─────────────────────────────────────────────

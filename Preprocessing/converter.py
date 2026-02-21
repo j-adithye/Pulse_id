@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-converter.py    Batch preprocessing for the dorsal hand vein dataset.
+converter.py  –  Batch preprocessing for the dorsal hand vein dataset.
 
 Walks dataset/ (person1/ … person400/), runs the full preprocessing
 pipeline from preprocessing.py on every .jpg image, and saves the
@@ -42,6 +42,7 @@ Sato_SCALE_STEP      = pp.Sato_SCALE_STEP
 CLAHE_PRE_CLIP       = pp.CLAHE_PRE_CLIP
 CLAHE_POST_CLIP      = pp.CLAHE_POST_CLIP
 CLAHE_TILE_SIZE      = pp.CLAHE_TILE_SIZE
+TARGET_SIZE          = pp.TARGET_SIZE
 # ===========================================================================
 
 
@@ -89,16 +90,16 @@ def _run_pipeline(src_path: Path, dst_path: Path) -> tuple[bool, None]:
             defect_depth_min=MCP_DEFECT_DEPTH_MIN,
         )
 
-        # Step 6 – Otsu Segmentation
-        _, img = pp.segment_hand_otsu(img, otsu_offset=OTSU_OFFSET)
+        # Step 6 – Otsu Segmentation  (get mask only — do NOT apply it yet)
+        mask, _ = pp.segment_hand_otsu(img, otsu_offset=OTSU_OFFSET)
 
-        # Step 7 – CLAHE Pre-Enhancement
+        # Step 7 – CLAHE Pre-Enhancement  (on raw metacarpal — no hard edges)
         img = pp.apply_clahe(img,
                              clip_limit=CLAHE_PRE_CLIP,
                              tile_size=CLAHE_TILE_SIZE,
                              label="pre-Sato")
 
-        # Step 8 – Sato Vesselness Filter
+        # Step 8 – Sato Vesselness Filter  (sees smooth image, not hard-cut mask)
         img = pp.apply_sato_filter(
             img,
             scale_min=Sato_SCALE_MIN,
@@ -107,14 +108,18 @@ def _run_pipeline(src_path: Path, dst_path: Path) -> tuple[bool, None]:
             black_ridges=True,
         )
 
-        # Step 9 – CLAHE Post-Enhancement
+        # Step 9 – Apply feathered mask THEN CLAHE post
+        # Feathered mask must come AFTER Sato — applying mask before Sato
+        # creates hard zero-boundaries that Sato detects as strong ridges,
+        # producing the bright rectangular border artifact.
+        img = pp.apply_feathered_mask(img, mask, fade_px=12)
         img = pp.apply_clahe(img,
                              clip_limit=CLAHE_POST_CLIP,
                              tile_size=CLAHE_TILE_SIZE,
                              label="post-Sato")
 
-        # Step 10 – Resize to 224 × 224
-        img = pp.resize_image(img, target_size=224)
+        # Step 10 – Resize to 128 x 128
+        img = pp.pad_and_resize(img, mask, target_size=TARGET_SIZE)
 
         # Step 11 – Z-score Normalization
         img_norm = pp.normalize_image(img)
@@ -130,7 +135,7 @@ def _run_pipeline(src_path: Path, dst_path: Path) -> tuple[bool, None]:
         return True, None
 
     except Exception:
-        return False, f"FAILED {src_path}:\n{traceback.format_exc()}" # type: ignore
+        return False, f"FAILED {src_path}:\n{traceback.format_exc()}"
 
 
 def collect_jobs(dataset_dir: Path, output_dir: Path) -> tuple[list, int]:
@@ -154,27 +159,71 @@ def run(dataset_dir: Path, output_dir: Path, workers: int) -> None:
         print("No .jpg images found – check the dataset path.")
         sys.exit(1)
 
-    failures      = []
-    persons_done  = 0
-    person_img_ok = {}   # person_name -> images successfully done
+    import time
+
+    failures         = []
+    persons_done     = 0
+    images_done      = 0
+    total_images     = len(jobs)
+    person_img_ok    = {}
     person_img_total = {}
+    last_person      = "—"
+    start_time       = time.time()
+
     for _, _, pname in jobs:
         person_img_total[pname] = person_img_total.get(pname, 0) + 1
 
-    def _print_progress():
-        print(f"\r{persons_done}/{total_persons}", end="", flush=True)
+    NUM_LINES = 8  # number of lines in the display block
 
-    _print_progress()
+    def _clear_lines(n):
+        """Move cursor up n lines and clear each one."""
+        for _ in range(n):
+            print("\033[A\033[2K", end="")
+
+    def _bar(done, total, width=30):
+        filled = int(width * done / total) if total else 0
+        return f"[{'█' * filled}{'░' * (width - filled)}]"
+
+    def _fmt_time(seconds):
+        seconds = int(seconds)
+        h, r = divmod(seconds, 3600)
+        m, s = divmod(r, 60)
+        return f"{h}h {m:02}m {s:02}s" if h else f"{m}m {s:02}s"
+
+    def _print_progress(first=False):
+        elapsed   = time.time() - start_time
+        img_rate  = images_done / elapsed if elapsed > 0 else 0
+        imgs_left = total_images - images_done
+        eta_secs  = imgs_left / img_rate if img_rate > 0 else 0
+
+        person_pct = (persons_done / total_persons * 100) if total_persons else 0
+        image_pct  = (images_done  / total_images  * 100) if total_images  else 0
+
+        if not first:
+            _clear_lines(NUM_LINES)
+
+        print(f"  ┌─────────────────────────────────────────┐")
+        print(f"  │  Persons   {_bar(persons_done, total_persons)}  {persons_done:>4}/{total_persons}  ({person_pct:5.1f}%)  │")
+        print(f"  │  Images    {_bar(images_done,  total_images )}  {images_done:>4}/{total_images}  ({image_pct:5.1f}%)  │")
+        print(f"  │                                           │")
+        print(f"  │  Last finished : {last_person:<24} │")
+        print(f"  │  Speed         : {img_rate:>6.2f} img/s              │")
+        print(f"  │  Elapsed       : {_fmt_time(elapsed):<26} │")
+        print(f"  └─────────────────────────────────────────┘")
+
+    _print_progress(first=True)
 
     def _handle(pname, success, msg):
-        nonlocal persons_done
+        nonlocal persons_done, images_done, last_person
+        images_done += 1
         if success:
             person_img_ok[pname] = person_img_ok.get(pname, 0) + 1
             if person_img_ok[pname] == person_img_total[pname]:
                 persons_done += 1
-                _print_progress()
+                last_person = pname
         else:
             failures.append(msg)
+        _print_progress()
 
     if workers == 1:
         for src, dst, pname in jobs:
@@ -189,11 +238,12 @@ def run(dataset_dir: Path, output_dir: Path, workers: int) -> None:
                 success, msg = future.result()
                 _handle(pname, success, msg)
 
-    print()  # newline after progress
+    elapsed = time.time() - start_time
+    print(f"\n  ✓ Done — {persons_done} persons, {images_done} images in {_fmt_time(elapsed)}")
     if failures:
-        print(f"\nFailed ({len(failures)}):")
+        print(f"\n  Failed ({len(failures)}):")
         for f in failures:
-            print("  •", f.splitlines()[0])
+            print(f"    • {f.splitlines()[0]}")
 
 
 # ---------------------------------------------------------------------------

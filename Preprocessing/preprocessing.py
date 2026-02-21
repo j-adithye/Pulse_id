@@ -15,7 +15,7 @@ Pipeline:
   7. CLAHE pre-enhancement  (boosts low-contrast NIR vein structure)
   8. Sato Vesselness Filter  (pure NumPy/SciPy, no DLL issues)
   9. CLAHE post-enhancement
- 10. Resize to 224x224
+ 10. Tight crop ROI + Resize to TARGET_SIZE
  11. Z-score Normalization
 """        
 
@@ -31,7 +31,7 @@ from scipy.ndimage import uniform_filter1d
 #  CONFIGURATION  -- edit these values to tune the pipeline
 # ==============================================================================
 
-IMAGE_PATH  = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\dataset\\person92\\vein_1.jpg"
+IMAGE_PATH  = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\dataset\\person9\\vein_1.jpg"
 OUTPUT_PATH = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\image\\vein_processed.jpg"
 
 # -- Otsu threshold offset -----------------------------------------------------
@@ -49,11 +49,10 @@ OTSU_OFFSET = -20
 WRIST_JUNCTION_RISE = 0.15
 
 # -- Sato filter -------------------------------------------------------------
-Sato_SCALE_MIN  = 1    # minimum vein thickness to detect (pixels)
-Sato_SCALE_MAX  = 2    # maximum vein thickness to detect (pixels)
+Sato_SCALE_MIN  = 3    # minimum vein thickness to detect (pixels)
+Sato_SCALE_MAX  = 3    # maximum vein thickness to detect (pixels)
 Sato_SCALE_STEP = 1    # step between scales (1 = thorough, 2 = faster)
-Sato_ALPHA      = 0.7  # plate-like vs line-like sensitivity
-Sato_BETA       = 0.9  # blob suppression
+
 
 # -- Finger removal ------------------------------------------------------------
 #   Uses convexity defects to locate the MCP knuckle line (where fingers begin
@@ -67,6 +66,12 @@ Sato_BETA       = 0.9  # blob suppression
 #                          real finger valley.  Raise if false valleys appear.
 MCP_SAFETY_MARGIN    = 0.03
 MCP_DEFECT_DEPTH_MIN = 20    # pixels
+
+# -- Output size ---------------------------------------------------------------
+#   128 is recommended for Pi deployment: small model, fast inference.
+#   Tight-crop is applied before resize so no black padding is wasted.
+#   Increase to 160 or 224 if accuracy matters more than speed.
+TARGET_SIZE = 224
 
 # -- CLAHE ---------------------------------------------------------------------
 CLAHE_PRE_CLIP  = 1.5  # clip limit for pre-Sato CLAHE (boosts NIR contrast)
@@ -330,7 +335,7 @@ def remove_fingers_mcp(img, wrist_cut_col, wrist_side,
         return out, cut_coord
 
     safety_px = int((w if wrist_side in ('left', 'right') else h) * safety_margin)
-    '''
+
     # ==================================================================
     # PRIMARY: MediaPipe HandLandmarker
     # ==================================================================
@@ -431,7 +436,7 @@ def remove_fingers_mcp(img, wrist_cut_col, wrist_side,
 
         except Exception as e:
             print(f"  MediaPipe error ({e}) — using fallback method")
-    '''
+
     # ==================================================================
     # FALLBACK: Convex Hull + Convexity Defects
     # ==================================================================
@@ -602,12 +607,84 @@ def apply_sato_filter(img,
 
     return result
 
-def resize_image(img, target_size=224):
-    """Resize to CNN input size."""
-    resized = cv2.resize(img, (target_size, target_size),
+def apply_feathered_mask(img, mask, fade_px=12):
+    """
+    Apply hand mask with a soft fade near the boundary.
+
+    Instead of hard-zeroing outside the mask (which creates sharp edges
+    that Sato detects as ridges), erode the mask then blur it to create
+    a smooth transition from 0 outside to 1 inside.
+
+    Args:
+        img     : uint8 grayscale Sato output.
+        mask    : Binary hand mask (255 = hand, 0 = background).
+        fade_px : Approximate fade width in pixels.
+
+    Returns:
+        Masked uint8 image with smooth boundary.
+    """
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (fade_px, fade_px))
+    mask_soft = cv2.erode(mask, k, iterations=1)
+    mask_soft = cv2.GaussianBlur(mask_soft.astype(np.float32),
+                                 (fade_px*2+1, fade_px*2+1), 0) / 255.0
+    return (img.astype(np.float32) * mask_soft).astype(np.uint8)
+
+
+def pad_and_resize(img, mask, target_size=TARGET_SIZE, padding=6):
+    """
+    Tight-crop the hand ROI, pad to a square preserving aspect ratio,
+    then resize to target_size.
+
+    Avoids two problems:
+      1. Black padding waste — without tight crop, hand occupies only ~35%
+         of the 512x512 frame so most pixels are wasted background.
+      2. Aspect ratio distortion — naive square resize of a non-square ROI
+         stretches the vein pattern and changes apparent vein spacing.
+
+    Strategy: crop tight → find longest side → pad shorter side equally
+    on both ends with zeros → resize square. The hand stays centred and
+    undistorted.
+
+    Args:
+        img         : Grayscale image (after Sato + CLAHE).
+        mask        : Binary hand mask.
+        target_size : Output side length in pixels (default 128).
+        padding     : Extra pixels around tight bbox before squaring (default 6).
+
+    Returns:
+        Square image of shape (target_size, target_size).
+    """
+    nz = np.where(mask > 0)
+    if len(nz[0]) == 0:
+        print(f"  WARNING: empty mask — centre-padding full frame")
+        nz = np.where(img > 0)
+        if len(nz[0]) == 0:
+            return cv2.resize(img, (target_size, target_size))
+
+    h, w  = img.shape
+    r_min = max(0, int(nz[0].min()) - padding)
+    r_max = min(h, int(nz[0].max()) + padding)
+    c_min = max(0, int(nz[1].min()) - padding)
+    c_max = min(w, int(nz[1].max()) + padding)
+
+    cropped = img[r_min:r_max, c_min:c_max]
+    ch, cw  = cropped.shape
+
+    # Pad shorter dimension to make it square (centre the content)
+    side = max(ch, cw)
+    pad_top    = (side - ch) // 2
+    pad_bottom = side - ch - pad_top
+    pad_left   = (side - cw) // 2
+    pad_right  = side - cw - pad_left
+
+    squared = cv2.copyMakeBorder(cropped,
+                                 pad_top, pad_bottom, pad_left, pad_right,
+                                 cv2.BORDER_CONSTANT, value=0)
+    resized = cv2.resize(squared, (target_size, target_size),
                          interpolation=cv2.INTER_CUBIC)
-    print(f"  Resized to {target_size}x{target_size}")
+    print(f"  ROI: {cw}x{ch}px  padded to {side}x{side}  ->  {target_size}x{target_size}")
     return resized
+
 
 
 def normalize_image(img):
@@ -627,36 +704,29 @@ def normalize_image(img):
 
 def visualize_pipeline(stages):
     """
-    Display every pipeline stage in a grid with a dark background.
+    Display 8 pipeline stages in a 2-row x 4-col grid on a dark background.
 
-    Args:
-        stages: list of (image_array, title_string) tuples.
+    Each panel shows the cumulative result after that group of steps:
+      Row 1: Original | Blur+Crop | Wrist+Finger cut | Otsu segmented
+      Row 2: CLAHE pre | Sato     | CLAHE post       | Resized+Normalized
     """
-    n     = len(stages)
-    ncols = 6
-    nrows = (n + ncols - 1) // ncols
+    assert len(stages) == 8, f"Expected 8 stages, got {len(stages)}"
 
-    fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(ncols * 4, nrows * 4))
+    fig, axes = plt.subplots(2, 4, figsize=(4 * 4, 2 * 4.2))
     fig.patch.set_facecolor('#0d1117')
-    axes_flat = list(axes.flat) if hasattr(axes, 'flat') else [axes]
 
-    for ax, (img, title) in zip(axes_flat, stages):
-        # For float normalized images, rescale display to [0, 1]
+    for ax, (img, title) in zip(axes.flat, stages):
         display = img
         if img.dtype in (np.float32, np.float64):
             lo, hi = img.min(), img.max()
             display = (img - lo) / (hi - lo + 1e-10)
         ax.imshow(display, cmap='gray', interpolation='nearest')
-        ax.set_title(title, color='white', fontsize=10,
-                     fontweight='bold', pad=5)
+        ax.set_title(title, color='white', fontsize=11,
+                     fontweight='bold', pad=6)
         ax.axis('off')
 
-    for ax in axes_flat[n:]:
-        ax.set_visible(False)
-
-    plt.suptitle('Dorsal Hand Vein -- Preprocessing Pipeline',
-                 color='white', fontsize=14, fontweight='bold', y=1.01)
+    plt.suptitle('Dorsal Hand Vein — Preprocessing Pipeline',
+                 color='white', fontsize=14, fontweight='bold', y=1.02)
     plt.tight_layout()
     print("\nDisplaying pipeline visualization -- close the window to exit")
     plt.show()
@@ -681,6 +751,7 @@ if __name__ == "__main__":
     print(f"  MCP_DEFECT_DEPTH_MIN = {MCP_DEFECT_DEPTH_MIN}px")
     print(f"  Sato scales        = {Sato_SCALE_MIN}-{Sato_SCALE_MAX} "
           f"step {Sato_SCALE_STEP}")
+    print(f"  TARGET_SIZE          = {TARGET_SIZE}x{TARGET_SIZE}")
     print(f"  CLAHE pre/post clip  = {CLAHE_PRE_CLIP} / {CLAHE_POST_CLIP}")
     print("=" * 60)
 
@@ -713,16 +784,16 @@ if __name__ == "__main__":
         defect_depth_min=MCP_DEFECT_DEPTH_MIN,
     )
 
-    print("\n[Step 6] Otsu Segmentation")
+    print("\n[Step 6] Otsu Segmentation  (mask only — not applied yet)")
     mask, img_segmented = segment_hand_otsu(img_metacarpal, otsu_offset=OTSU_OFFSET)
 
-    print("\n[Step 7] CLAHE Pre-Enhancement")
-    img_clahe_pre = apply_clahe(img_segmented,
+    print("\n[Step 7] CLAHE Pre-Enhancement  (on raw metacarpal — no hard edges)")
+    img_clahe_pre = apply_clahe(img_metacarpal,
                                 clip_limit=CLAHE_PRE_CLIP,
                                 tile_size=CLAHE_TILE_SIZE,
                                 label="pre-Sato")
 
-    print("\n[Step 8] Sato Filter")
+    print("\n[Step 8] Sato Filter  (on smooth image — no boundary artifacts)")
     img_Sato = apply_sato_filter(
         img_clahe_pre,
         scale_min=Sato_SCALE_MIN,
@@ -731,14 +802,15 @@ if __name__ == "__main__":
         black_ridges=True,
     )
 
-    print("\n[Step 9] CLAHE Post-Enhancement")
+    print("\n[Step 9] Apply feathered mask + CLAHE post")
+    img_Sato      = apply_feathered_mask(img_Sato, mask, fade_px=12)
     img_clahe_post = apply_clahe(img_Sato,
                                  clip_limit=CLAHE_POST_CLIP,
                                  tile_size=CLAHE_TILE_SIZE,
                                  label="post-Sato")
 
-    print("\n[Step 10] Resize")
-    img_resized = resize_image(img_clahe_post, target_size=224)
+    print("\n[Step 10] Tight Crop + Resize")
+    img_resized = pad_and_resize(img_clahe_post, mask, target_size=TARGET_SIZE)
 
     print("\n[Step 11] Normalize")
     img_normalized = normalize_image(img_resized)
@@ -756,19 +828,14 @@ if __name__ == "__main__":
     print("PREPROCESSING COMPLETE")
     print("=" * 60)
 
-    # Show all pipeline stages
     stages = [
         (img_original,   "1. Original"),
-        (img_blurred,    "2. Gaussian Blur"),
-        (img_cropped,    "3. Smart Crop (512x512)"),
-        (img_no_wrist,   "4. Wrist Removed"),
-        (img_metacarpal, "5. Fingers Removed (MCP)"),
-        (mask,           "6. Otsu Mask"),
-        (img_segmented,  "7. Segmented"),
-        (img_clahe_pre,  "8. CLAHE Pre-Sato"),
-        (img_Sato,     "9. Sato Filter"),
-        (img_clahe_post, "10. CLAHE Post-Sato"),
-        (img_resized,    "11. Resized 224x224"),
-        (img_save,       "12. Normalized (display)"),
+        (img_cropped,    "2. Blur + Crop"),
+        (img_metacarpal, "3. Wrist + Finger removed"),
+        (img_segmented,  "4. Segmented"),
+        (img_clahe_pre,  "5. CLAHE Pre-Sato"),
+        (img_Sato,       "6. Sato Filter"),
+        (img_clahe_post, "7. CLAHE Post-Sato"),
+        (img_save,       f"8. {TARGET_SIZE}x{TARGET_SIZE} Normalized"),
     ]
     visualize_pipeline(stages)
