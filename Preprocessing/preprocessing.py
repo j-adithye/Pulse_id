@@ -68,10 +68,10 @@ MCP_SAFETY_MARGIN    = 0.03
 MCP_DEFECT_DEPTH_MIN = 20    # pixels
 
 # -- Output size ---------------------------------------------------------------
-#   128 is recommended for Pi deployment: small model, fast inference.
+#   224 is recommended for Pi deployment: small model, fast inference.
 #   Tight-crop is applied before resize so no black padding is wasted.
 #   Increase to 160 or 224 if accuracy matters more than speed.
-TARGET_SIZE = 128
+TARGET_SIZE = 224
 
 # -- CLAHE ---------------------------------------------------------------------
 CLAHE_PRE_CLIP  = 1.5  # clip limit for pre-Sato CLAHE (boosts NIR contrast)
@@ -630,7 +630,7 @@ def apply_feathered_mask(img, mask, fade_px=12):
     return (img.astype(np.float32) * mask_soft).astype(np.uint8)
 
 
-def pad_and_resize(img, mask, target_size=128, padding=6):
+def pad_and_resize(img, mask, target_size=224, padding=6):
     """
     Tight-crop the hand ROI, pad to a square preserving aspect ratio,
     then resize to target_size.
@@ -648,7 +648,7 @@ def pad_and_resize(img, mask, target_size=128, padding=6):
     Args:
         img         : Grayscale image (after Sato + CLAHE).
         mask        : Binary hand mask.
-        target_size : Output side length in pixels (default 128).
+        target_size : Output side length in pixels (default 224).
         padding     : Extra pixels around tight bbox before squaring (default 6).
 
     Returns:
