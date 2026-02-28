@@ -129,8 +129,9 @@ def _run_pipeline(src_path: Path, dst_path: Path) -> tuple[bool, None]:
         img_save = ((img_norm - lo) / (hi - lo + 1e-10) * 255).astype(np.uint8)
 
         # Ensure destination directory exists and write
+        dst_path = dst_path.with_suffix('.png')
         dst_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(dst_path), img_save)
+        cv2.imwrite(str(dst_path), img_save, [cv2.IMWRITE_PNG_COMPRESSION, 9])
 
         return True, None
 

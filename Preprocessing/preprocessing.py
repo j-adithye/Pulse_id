@@ -31,8 +31,8 @@ from scipy.ndimage import uniform_filter1d
 #  CONFIGURATION  -- edit these values to tune the pipeline
 # ==============================================================================
 
-IMAGE_PATH  = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\dataset\\person9\\vein_1.jpg"
-OUTPUT_PATH = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\image\\vein_processed.jpg"
+IMAGE_PATH  = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\dataset\\person15\\vein_1.jpg"
+OUTPUT_PATH = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\image\\vein_processed.png"
 
 # -- Otsu threshold offset -----------------------------------------------------
 #   0   = pure Otsu (automatic)
@@ -71,7 +71,7 @@ MCP_DEFECT_DEPTH_MIN = 20    # pixels
 #   128 is recommended for Pi deployment: small model, fast inference.
 #   Tight-crop is applied before resize so no black padding is wasted.
 #   Increase to 160 or 224 if accuracy matters more than speed.
-TARGET_SIZE = 224
+TARGET_SIZE = 128
 
 # -- CLAHE ---------------------------------------------------------------------
 CLAHE_PRE_CLIP  = 1.5  # clip limit for pre-Sato CLAHE (boosts NIR contrast)
@@ -630,7 +630,7 @@ def apply_feathered_mask(img, mask, fade_px=12):
     return (img.astype(np.float32) * mask_soft).astype(np.uint8)
 
 
-def pad_and_resize(img, mask, target_size=TARGET_SIZE, padding=6):
+def pad_and_resize(img, mask, target_size=128, padding=6):
     """
     Tight-crop the hand ROI, pad to a square preserving aspect ratio,
     then resize to target_size.
@@ -820,7 +820,7 @@ if __name__ == "__main__":
         (img_normalized - img_normalized.min()) /
         (img_normalized.max() - img_normalized.min()) * 255
     ).astype(np.uint8)
-    cv2.imwrite(OUTPUT_PATH, img_save)
+    cv2.imwrite(OUTPUT_PATH, img_save, [cv2.IMWRITE_PNG_COMPRESSION, 9])
     print(f"\nSaved: {OUTPUT_PATH}")
     print(f"Final shape: {img_normalized.shape}  dtype: {img_normalized.dtype}")
 
