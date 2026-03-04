@@ -118,7 +118,7 @@ def _run_pipeline(src_path: Path, dst_path: Path) -> tuple[bool, None]:
                              tile_size=CLAHE_TILE_SIZE,
                              label="post-Sato")
 
-        # Step 10 – Resize to 128 x 128
+        # Step 10 – Resize to 224
         img = pp.pad_and_resize(img, mask, target_size=TARGET_SIZE)
 
         # Step 11 – Z-score Normalization

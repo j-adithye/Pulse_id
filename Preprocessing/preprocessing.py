@@ -3,14 +3,14 @@
 Dorsal Hand Vein Preprocessing Pipeline
 
 REQUIREMENTS:
-    pip install opencv-python numpy matplotlib scikit-image scipy
+    pip install opencv-python numpy scipy scikit-image matplotlib
 
 Pipeline:
   1. Load (grayscale)
   2. Gaussian Blur
   3. Smart Crop  (Otsu-based hand detection + centering)
   4. Wrist Removal  (column-profile geometry, no external model needed)
-  5. Finger Removal  (MCP knuckle line via convexity defects)
+  5. Finger Removal  (convex hull + convexity defects — no MediaPipe)
   6. Otsu Segmentation
   7. CLAHE pre-enhancement  (boosts low-contrast NIR vein structure)
   8. Sato Vesselness Filter  (pure NumPy/SciPy, no DLL issues)
@@ -21,7 +21,6 @@ Pipeline:
 
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 import time
 import os
 from scipy.ndimage import uniform_filter1d
@@ -279,189 +278,44 @@ def remove_fingers_mcp(img, wrist_cut_col, wrist_side,
                        safety_margin=0.03,
                        defect_depth_min=20):
     """
-    Remove fingers by locating the MCP knuckle line.
+    Locate the MCP knuckle line using convex hull convexity defects and
+    zero out everything on the finger side.
 
-    PRIMARY METHOD  — MediaPipe HandLandmarker
-    ==========================================
-    Uses MediaPipe's 21-point hand landmark model to locate the 4 MCP knuckle
-    joints (landmarks 5, 9, 13, 17 = index/middle/ring/pinky bases).
-    These are the exact anatomical knuckle points — no thresholding involved.
-
-    A cut line is fitted through the 4 MCP points using linear regression so
-    it follows the natural slight diagonal of the knuckle row.  The cut is
-    offset toward the wrist by safety_margin to keep all knuckle tissue.
-
-    FALLBACK METHOD — column-segment counting (no model required)
-    =============================================================
-    Used automatically if:
-      • mediapipe is not installed, OR
-      • the model fails to detect a hand (bad lighting, low contrast, etc.)
-
-    Scans the hand mask column-by-column from the wrist.  The MCP line is the
-    first column where the silhouette stably splits into 2+ disconnected
-    segments (fingers beginning to separate).
+    The deep inter-finger valleys appear as convexity defects on the hand
+    silhouette.  Their mean x-coordinate gives a robust estimate of the MCP
+    line; a safety margin then shifts the cut toward the wrist so no knuckle
+    tissue is clipped.
 
     Args:
-        img              : Wrist-removed grayscale image (uint8).
-        wrist_cut_col    : Column/row of the wrist cut (safety lower bound).
+        img              : Wrist-removed uint8 grayscale.
+        wrist_cut_col    : Column of the wrist cut (lower bound for mcp_cut).
         wrist_side       : 'left' | 'right' | 'top' | 'bottom'
-        otsu_offset      : Threshold offset used only by the fallback method.
-        safety_margin    : Fraction of image dimension to shift the cut back
-                           toward the wrist from the detected knuckle line.
-                           0.03 = 3 % (default).  Increase to keep more knuckle.
-        defect_depth_min : Unused — kept for API compatibility.
+        otsu_offset      : Threshold offset for building the hand mask.
+        safety_margin    : Fraction of image width shifted toward wrist.
+        defect_depth_min : Minimum defect depth (px) to count as a valley.
 
     Returns:
-        img_metacarpal : Image with finger region zeroed out.
-        mcp_cut        : Pixel coordinate (column or row) of the cut.
+        img_metacarpal : uint8 image with finger region zeroed out.
+        mcp_cut        : Column (or row) of the cut.
     """
     t0   = time.time()
     h, w = img.shape
 
-    # ------------------------------------------------------------------
-    # Helper shared by both methods
-    # ------------------------------------------------------------------
-    def apply_cut(cut_coord):
-        """Zero out the finger side and return (img_out, cut_coord)."""
-        out = img.copy()
-        if wrist_side == 'left':
-            out[:, cut_coord:] = 0
-        elif wrist_side == 'right':
-            out[:, :cut_coord] = 0
-        elif wrist_side == 'top':
-            out[cut_coord:, :] = 0
-        else:  # bottom
-            out[:cut_coord, :] = 0
-        return out, cut_coord
-
-    safety_px = int((w if wrist_side in ('left', 'right') else h) * safety_margin)
-
-    # ==================================================================
-    # PRIMARY: MediaPipe HandLandmarker
-    # ==================================================================
-    _mp_ok = False
-    try:
-        import mediapipe as mp
-        from mediapipe.tasks.python import vision as mp_vision
-        from mediapipe.tasks.python import BaseOptions
-        from mediapipe.tasks.python.vision import HandLandmarkerOptions, RunningMode
-        _mp_ok = True
-    except Exception:
-        print("\n Import Failed")
-        print(Exception)
-
-    # Find the .task model file — look next to this script and in cwd
-    _model_path = None
-    if _mp_ok:
-        import os
-        candidates = [
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         'hand_landmarker.task'),
-            os.path.join(os.getcwd(), 'hand_landmarker.task'),
-            'hand_landmarker.task',
-        ]
-        for c in candidates:
-            if os.path.isfile(c):
-                _model_path = c
-                break
-        if _model_path is None:
-            print("  MediaPipe: hand_landmarker.task not found next to script or in cwd")
-            print("  Download: https://storage.googleapis.com/mediapipe-models/"
-                  "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task")
-            _mp_ok = False
-
-    if _mp_ok:
-        try:
-            # Convert grayscale → RGB (MediaPipe expects 3-channel)
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-
-            # Normalise low-brightness NIR images so detection is more reliable
-            # (stretch to full 0-255 range before passing to the model)
-            lo, hi = img_rgb.min(), img_rgb.max()
-            if hi > lo:
-                img_rgb = ((img_rgb.astype(np.float32) - lo) /
-                           (hi - lo) * 255).astype(np.uint8)
-
-            options = HandLandmarkerOptions(
-                base_options   = BaseOptions(model_asset_path=_model_path),
-                running_mode   = RunningMode.IMAGE,
-                num_hands      = 1,
-                min_hand_detection_confidence = 0.2,
-                min_hand_presence_confidence  = 0.2,
-                min_tracking_confidence       = 0.2,
-            )
-            with mp_vision.HandLandmarker.create_from_options(options) as detector:
-                mp_img  = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
-                result  = detector.detect(mp_img)
-
-            if result.hand_landmarks:
-                lm = result.hand_landmarks[0]   # first detected hand
-
-                # MCP joints: 5=index, 9=middle, 13=ring, 17=pinky
-                mcp_ids = [5, 9, 13, 17]
-                mcp_pts = [(lm[i].x * w, lm[i].y * h) for i in mcp_ids]
-
-                print(f"  MediaPipe: detected hand  "
-                      f"MCP points (px): " +
-                      "  ".join([f"({p[0]:.0f},{p[1]:.0f})" for p in mcp_pts]))
-
-                # Fit line through MCP points using least-squares
-                # For horizontal hands (wrist left/right) use x as the cut coord
-                if wrist_side in ('left', 'right'):
-                    xs = [p[0] for p in mcp_pts]
-                    mcp_raw = int(np.mean(xs))      # mean x of knuckle bases
-                else:
-                    ys = [p[1] for p in mcp_pts]
-                    mcp_raw = int(np.mean(ys))      # mean y of knuckle bases
-
-                # Shift toward wrist by safety margin
-                wrist_bound = wrist_cut_col if wrist_cut_col is not None else 0
-                if wrist_side == 'left':
-                    mcp_cut = max(wrist_bound, mcp_raw - safety_px)
-                elif wrist_side == 'right':
-                    mcp_cut = min(wrist_bound, mcp_raw + safety_px)
-                elif wrist_side == 'top':
-                    mcp_cut = max(wrist_bound, mcp_raw - safety_px)
-                else:
-                    mcp_cut = min(wrist_bound, mcp_raw + safety_px)
-
-                img_out, mcp_cut = apply_cut(mcp_cut)
-                print(f"  MediaPipe: MCP raw={mcp_raw}  "
-                      f"safety={safety_px}px  cut={mcp_cut}")
-                print(f"  Finger removal done in {time.time()-t0:.3f}s  [MediaPipe]")
-                return img_out, mcp_cut
-
-            else:
-                print("  MediaPipe: no hand detected — using fallback method")
-
-        except Exception as e:
-            print(f"  MediaPipe error ({e}) — using fallback method")
-
-    # ==================================================================
-    # FALLBACK: Convex Hull + Convexity Defects
-    # ==================================================================
-    print("  Using fallback: convex hull + convexity defects")
-
-    otsu_val, _ = cv2.threshold(img, 0, 255,
-                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Build binary hand mask
+    otsu_val, _ = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     adj = int(np.clip(otsu_val + otsu_offset, 0, 255))
     _, binary = cv2.threshold(img, adj, 255, cv2.THRESH_BINARY)
-
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel)
 
-    contours, _ = cv2.findContours(binary,
-                                cv2.RETR_EXTERNAL,
-                                cv2.CHAIN_APPROX_SIMPLE)
-
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         print("  WARNING: No contour found — skipping finger removal")
         return img.copy(), None
 
-    cnt = max(contours, key=cv2.contourArea)
-
-    # Convex hull (indices required for defects)
+    cnt  = max(contours, key=cv2.contourArea)
     hull = cv2.convexHull(cnt, returnPoints=False)
 
     if hull is None or len(hull) < 3:
@@ -469,32 +323,28 @@ def remove_fingers_mcp(img, wrist_cut_col, wrist_side,
         return img.copy(), None
 
     defects = cv2.convexityDefects(cnt, hull)
-
     if defects is None:
-        print("  WARNING: No convexity defects found — skipping finger removal")
+        print("  WARNING: No convexity defects — skipping finger removal")
         return img.copy(), None
 
-    # Collect deep defects (finger valleys)
+    # Collect deep valley points (finger gaps)
     valley_pts = []
     for d in defects:
         s, e, f, depth = d[0]
-        depth_px = depth / 256.0
-        if depth_px > defect_depth_min:
-            far = cnt[f][0]   # deepest valley point
-            valley_pts.append(far)
+        if depth / 256.0 > defect_depth_min:
+            valley_pts.append(cnt[f][0])  # (x, y) of deepest point
 
     if len(valley_pts) < 2:
-        print("  WARNING: Insufficient finger valleys — skipping finger removal")
+        print("  WARNING: Too few finger valleys — skipping finger removal")
         return img.copy(), None
 
     valley_pts = np.array(valley_pts)
 
-    # Estimate MCP cut line
     if wrist_side in ('left', 'right'):
-        raw_cut = int(np.mean(valley_pts[:, 0]))   # x-coordinate
+        raw_cut   = int(np.mean(valley_pts[:, 0]))
         safety_px = int(w * safety_margin)
     else:
-        raw_cut = int(np.mean(valley_pts[:, 1]))   # y-coordinate
+        raw_cut   = int(np.mean(valley_pts[:, 1]))
         safety_px = int(h * safety_margin)
 
     wrist_bound = wrist_cut_col if wrist_cut_col is not None else 0
@@ -508,7 +358,6 @@ def remove_fingers_mcp(img, wrist_cut_col, wrist_side,
     else:
         mcp_cut = min(wrist_bound, raw_cut + safety_px)
 
-    # Apply cut
     img_out = img.copy()
     if wrist_side == 'left':
         img_out[:, mcp_cut:] = 0
@@ -519,10 +368,9 @@ def remove_fingers_mcp(img, wrist_cut_col, wrist_side,
     else:
         img_out[:mcp_cut, :] = 0
 
-    print(f"  Convexity fallback: valleys={len(valley_pts)}  "
-        f"raw_cut={raw_cut}  safety={safety_px}px  cut={mcp_cut}")
+    print(f"  Convexity defects: valleys={len(valley_pts)}  "
+          f"raw_cut={raw_cut}  safety={safety_px}px  cut={mcp_cut}")
     print(f"  Finger removal done in {time.time()-t0:.3f}s  [convexity]")
-
     return img_out, mcp_cut
 
 
@@ -712,6 +560,7 @@ def visualize_pipeline(stages):
     """
     assert len(stages) == 8, f"Expected 8 stages, got {len(stages)}"
 
+    import matplotlib.pyplot as plt  # lazy — not needed on Pi server
     fig, axes = plt.subplots(2, 4, figsize=(4 * 4, 2 * 4.2))
     fig.patch.set_facecolor('#0d1117')
 
