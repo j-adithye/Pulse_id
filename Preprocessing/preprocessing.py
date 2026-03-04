@@ -70,7 +70,7 @@ MCP_DEFECT_DEPTH_MIN = 20    # pixels
 #   224 is recommended for Pi deployment: small model, fast inference.
 #   Tight-crop is applied before resize so no black padding is wasted.
 #   Increase to 160 or 224 if accuracy matters more than speed.
-TARGET_SIZE = 224
+TARGET_SIZE = 128
 
 # -- CLAHE ---------------------------------------------------------------------
 CLAHE_PRE_CLIP  = 1.5  # clip limit for pre-Sato CLAHE (boosts NIR contrast)
