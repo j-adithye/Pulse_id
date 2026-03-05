@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Dorsal Palm Vein Siamese CNN — Kaggle Training Script
-Hard Negative Mining + per-epoch backbone checkpoint
+Palm Vein CNN — Triplet Loss + Online Semi-Hard Mining
+Changes from v2 (contrastive + offline mining):
+  - Triplet loss replacing contrastive loss
+  - Online semi-hard mining inside each batch (no separate mining callback)
+  - Identity-based batch sampler: K identities x N images per batch
+  - Val loss is real triplet loss on val batches
+  - All architecture improvements from v2 kept:
+      conv4_2, embedding_dim=128, no conv dropout, cosine annealing LR
 """
 
 import os
@@ -21,7 +27,7 @@ from tensorflow.keras import layers, Model, Input
 from tensorflow.keras.saving import register_keras_serializable
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import (
-    ModelCheckpoint, EarlyStopping, ReduceLROnPlateau, CSVLogger
+    ModelCheckpoint, EarlyStopping, CSVLogger
 )
 
 sys.path.insert(0, '/kaggle/working')
@@ -29,58 +35,44 @@ from augmentation import augment_image
 
 
 # ── PATHS ──
-OUTPUT_DIR    = '/kaggle/working/output'
+OUTPUT_DIR = '/kaggle/working/output'
+CKPT_DIR   = '/kaggle/working/checkpoints'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# ── CHECKPOINT DIR — backbone saved every epoch ──
-CKPT_DIR = '/kaggle/working/checkpoints'
-os.makedirs(CKPT_DIR, exist_ok=True)
+os.makedirs(CKPT_DIR,   exist_ok=True)
 
 
 # ── CONFIG ──
 CONFIG = {
     'output_dir':    OUTPUT_DIR,
     'backbone_path': os.path.join(OUTPUT_DIR, 'cnn_backbone.h5'),
-    'finetune_load_path': '/kaggle/input/models/suban1234/cnn-backbone/keras/default/1/cnn_backbone.h5',
-    'siamese_ckpt':  os.path.join(OUTPUT_DIR, 'siamese_best.h5'),
+    'best_ckpt':     os.path.join(OUTPUT_DIR, 'backbone_best.h5'),
     'tflite_path':   os.path.join(OUTPUT_DIR, 'cnn_backbone.tflite'),
     'deploy_config': os.path.join(OUTPUT_DIR, 'deployment_config.json'),
     'plot_path':     os.path.join(OUTPUT_DIR, 'training_curves.png'),
     'log_path':      os.path.join(OUTPUT_DIR, 'training_log.csv'),
     'ckpt_dir':      CKPT_DIR,
 
-    'img_size':          128,
-    'channels':          1,
-    'embedding_dim':     64,
+    'img_size':      128,
+    'channels':      1,
+    'embedding_dim': 128,
 
-    'train_ratio':       0.75,
-    'val_ratio':         0.15,
+    'train_ratio':   0.75,
+    'val_ratio':     0.15,
 
-    'train_neg_ratio':   3,
-    'eval_neg_ratio':    1,
-    'hard_neg_fraction': 0.6,
+    # Identity sampler — K identities x N images = batch size
+    'K':             32,    # identities per batch
+    'N':             4,     # images per identity per batch
 
-    'batch_size':        128,
-    'epochs':            50,
-    'learning_rate':     1e-4,
+    'epochs':        50,
+    'learning_rate': 1e-4,
+    'min_lr':        1e-6,
+    'es_patience':   15,
 
-    # ── Fine-tune specific ──
-    'finetune_lr':          5e-5,  # warm restart — higher than 1e-5, lower than 1e-4
-    'finetune_epochs':      25,    # max epochs — model is already converged
-    'finetune_es_patience': 7,     # tighter early stopping
-    'finetune_lr_patience': 3,     # faster LR reduction
+    'margin':        1.5,
 
-    'margin':            1.5,
+    'warmup_epochs': 5,
+    'restart_every': 20,
 }
-
-# Layers to FREEZE during fine-tuning (conv1 + conv2 blocks)
-# Only conv3, conv4, dense, embedding will be updated
-FINETUNE_FREEZE = [
-    'conv1_1', 'bn1_1', 'relu1_1',
-    'conv1_2', 'bn1_2', 'relu1_2', 'pool1', 'drop1',
-    'conv2_1', 'bn2_1', 'relu2_1',
-    'conv2_2', 'bn2_2', 'relu2_2', 'pool2', 'drop2',
-]
 
 
 # ────────────────────────────────
@@ -98,7 +90,7 @@ def load_dataset(processed_dir):
             for f in sorted(os.listdir(person_dir))
             if f.lower().endswith(('.png', '.jpg', '.jpeg'))
         ]
-        if len(images) >= 2:
+        if len(images) >= CONFIG['N']:
             class_map[person] = images
     total = sum(len(v) for v in class_map.values())
     print(f'Dataset: {len(class_map)} identities, {total} images')
@@ -108,9 +100,9 @@ def load_dataset(processed_dir):
 def split_classes(class_map):
     classes = list(class_map.keys())
     random.shuffle(classes)
-    n       = len(classes)
-    n_train = int(n * CONFIG['train_ratio'])
-    n_val   = int(n * CONFIG['val_ratio'])
+    n         = len(classes)
+    n_train   = int(n * CONFIG['train_ratio'])
+    n_val     = int(n * CONFIG['val_ratio'])
     train_cls = classes[:n_train]
     val_cls   = classes[n_train : n_train + n_val]
     test_cls  = classes[n_train + n_val :]
@@ -120,113 +112,6 @@ def split_classes(class_map):
         {c: class_map[c] for c in val_cls},
         {c: class_map[c] for c in test_cls},
     )
-
-
-# ────────────────────────────────
-#  PAIR GENERATION
-# ────────────────────────────────
-
-def generate_pairs(class_map, neg_ratio):
-    positives = []
-    for paths in class_map.values():
-        for a, b in combinations(paths, 2):
-            positives.append((a, b, 0))
-
-    class_list = list(class_map.keys())
-    target     = int(len(positives) * neg_ratio)
-    seen       = set()
-    negatives  = []
-
-    for _ in range(target * 10):
-        if len(negatives) >= target:
-            break
-        c1, c2 = random.sample(class_list, 2)
-        a = random.choice(class_map[c1])
-        b = random.choice(class_map[c2])
-        key = (min(a, b), max(a, b))
-        if key not in seen:
-            seen.add(key)
-            negatives.append((a, b, 1))
-
-    pairs = positives + negatives
-    random.shuffle(pairs)
-    print(f'  Pairs: pos={len(positives)}  neg={len(negatives)}  total={len(pairs)}')
-    return pairs
-
-
-def mine_hard_negatives(backbone, class_map, n_positives):
-    print('  Mining hard negatives...')
-
-    all_paths, all_ids = [], []
-    for identity, paths in class_map.items():
-        for p in paths:
-            all_paths.append(p)
-            all_ids.append(identity)
-    all_ids = np.array(all_ids)
-
-    sz = CONFIG['img_size']
-    ch = CONFIG['channels']
-
-    embeddings = []
-    for i in range(0, len(all_paths), CONFIG['batch_size']):
-        batch = all_paths[i : i + CONFIG['batch_size']]
-        imgs  = np.zeros((len(batch), sz, sz, ch), dtype=np.float32)
-        for j, p in enumerate(batch):
-            imgs[j] = load_image(p)
-        embeddings.append(backbone(imgs, training=False).numpy())
-    embeddings = np.vstack(embeddings)
-
-    margin     = CONFIG['margin']
-    target     = int(n_positives * CONFIG['train_neg_ratio'])
-    n_hard_max = int(target * CONFIG['hard_neg_fraction'])  # ceiling, not target
-    n_random_min = target - n_hard_max                      # minimum random floor
-    unique_ids = list(class_map.keys())
-    mine_n     = min(100, len(unique_ids))   # increased from 50 → 100
-
-    id_to_indices = {uid: np.where(all_ids == uid)[0] for uid in unique_ids}
-
-    hard_negs = []
-    seen      = set()
-    attempts  = 0
-
-    while len(hard_negs) < n_hard_max and attempts < n_hard_max * 20:
-        attempts += 1
-        id_a  = random.choice(unique_ids)
-        idx_a = random.choice(id_to_indices[id_a])
-        emb_a = embeddings[idx_a]
-
-        other = [i for i in unique_ids if i != id_a]
-        for id_b in random.sample(other, min(mine_n, len(other))):
-            idxs_b = id_to_indices[id_b]
-            dists  = np.linalg.norm(embeddings[idxs_b] - emb_a, axis=1)
-            hard   = np.where(dists < margin)[0]
-            if len(hard) == 0:
-                continue
-            h      = hard[np.argmin(dists[hard])]
-            pa, pb = all_paths[idx_a], all_paths[idxs_b[h]]
-            key    = (min(pa, pb), max(pa, pb))
-            if key not in seen:
-                seen.add(key)
-                hard_negs.append((pa, pb, 1))
-                break
-
-    # Random fills remaining up to target, but at least n_random_min
-    n_random_actual = max(n_random_min, target - len(hard_negs))
-    rand_negs = []
-    cl = list(class_map.keys())
-    for _ in range(n_random_actual * 5):
-        if len(rand_negs) >= n_random_actual:
-            break
-        c1, c2 = random.sample(cl, 2)
-        a, b   = random.choice(class_map[c1]), random.choice(class_map[c2])
-        key    = (min(a, b), max(a, b))
-        if key not in seen:
-            seen.add(key)
-            rand_negs.append((a, b, 1))
-
-    all_negs = hard_negs + rand_negs
-    print(f'  Hard={len(hard_negs)}  Random={len(rand_negs)}  Total={len(all_negs)}')
-    return all_negs
 
 
 # ────────────────────────────────
@@ -244,103 +129,64 @@ def load_image(path):
 
 
 # ────────────────────────────────
-#  DATA GENERATOR
+#  IDENTITY BATCH SAMPLER
 # ────────────────────────────────
 
-class PairGenerator(tf.keras.utils.Sequence):
-    def __init__(self, pairs, batch_size, augment=False, **kwargs):
+class IdentityBatchGenerator(tf.keras.utils.Sequence):
+    """
+    Samples K identities per batch, N images per identity.
+    Each batch contains K*N images with known identity labels.
+    Online semi-hard mining happens inside the triplet loss.
+    """
+    def __init__(self, class_map, K, N, augment=False, steps_per_epoch=None, **kwargs):
         super().__init__(**kwargs)
-        self.pairs      = pairs
-        self.batch_size = batch_size
-        self.augment    = augment
-        self.indices    = np.arange(len(pairs))
-
-    def update_pairs(self, new_pairs):
-        self.pairs   = new_pairs
-        self.indices = np.arange(len(new_pairs))
-        np.random.shuffle(self.indices)
+        self.class_map       = class_map
+        self.K               = K
+        self.N               = N
+        self.augment         = augment
+        self.identities      = list(class_map.keys())
+        self.steps_per_epoch = steps_per_epoch or len(self.identities) // K
 
     def __len__(self):
-        return int(np.ceil(len(self.pairs) / self.batch_size))
+        return self.steps_per_epoch
 
     def on_epoch_end(self):
-        np.random.shuffle(self.indices)
+        random.shuffle(self.identities)
 
     def __getitem__(self, idx):
-        batch = [self.pairs[i]
-                 for i in self.indices[idx*self.batch_size : (idx+1)*self.batch_size]]
         sz = CONFIG['img_size']
         ch = CONFIG['channels']
-        A  = np.zeros((len(batch), sz, sz, ch), dtype=np.float32)
-        B  = np.zeros((len(batch), sz, sz, ch), dtype=np.float32)
-        L  = np.zeros((len(batch),),            dtype=np.float32)
-        for i, (pa, pb, label) in enumerate(batch):
-            ia, ib = load_image(pa), load_image(pb)
-            if self.augment:
-                ia, ib = augment_image(ia), augment_image(ib)
-            A[i], B[i], L[i] = ia, ib, label
-        return (A, B), L
+        K  = self.K
+        N  = self.N
+
+        # Sample K identities
+        selected_ids = random.sample(self.identities, min(K, len(self.identities)))
+
+        imgs   = np.zeros((K * N, sz, sz, ch), dtype=np.float32)
+        labels = np.zeros((K * N,),            dtype=np.int32)
+
+        for i, identity in enumerate(selected_ids):
+            paths = self.class_map[identity]
+            # Sample N images from this identity (with replacement if needed)
+            sampled = random.choices(paths, k=N) if len(paths) < N else random.sample(paths, N)
+            for j, path in enumerate(sampled):
+                img = load_image(path)
+                if self.augment:
+                    img = augment_image(img)
+                imgs[i * N + j]   = img
+                labels[i * N + j] = i   # label = index within batch (0 to K-1)
+
+        return imgs, labels
 
 
 # ────────────────────────────────
-#  CALLBACKS
+#  BACKBONE
 # ────────────────────────────────
 
-class HardNegativeMiningCallback(tf.keras.callbacks.Callback):
-    """Refresh training pairs with hard negatives after each epoch."""
-    def __init__(self, backbone, train_gen, class_map, n_positives):
-        super().__init__()
-        self.backbone    = backbone
-        self.train_gen   = train_gen
-        self.class_map   = class_map
-        self.n_positives = n_positives
-
-    def on_epoch_end(self, epoch, logs=None):
-        if epoch == 0:
-            return
-        print(f'\n[Epoch {epoch+1}] Refreshing pairs with hard negatives...')
-        positives = [p for p in self.train_gen.pairs if p[2] == 0]
-        hard_negs = mine_hard_negatives(self.backbone, self.class_map, self.n_positives)
-        new_pairs = positives + hard_negs
-        random.shuffle(new_pairs)
-        self.train_gen.update_pairs(new_pairs)
-        print(f'  Pairs updated: {len(new_pairs)} total')
-
-
-class BackboneCheckpoint(tf.keras.callbacks.Callback):
-    """Saves the backbone (not the siamese wrapper) after every epoch."""
-    def __init__(self, backbone, ckpt_dir):
-        super().__init__()
-        self.backbone = backbone
-        self.ckpt_dir = ckpt_dir
-
-    def on_epoch_end(self, epoch, logs=None):
-        path = os.path.join(self.ckpt_dir, f'backbone_epoch_{epoch+1:02d}.h5')
-        self.backbone.save(path)
-        val_loss = logs.get('val_loss', float('nan'))
-        print(f'  Backbone checkpoint saved: backbone_epoch_{epoch+1:02d}.h5  '
-              f'(val_loss={val_loss:.4f})')
-
-
-# ────────────────────────────────
-#  CNN BACKBONE
-# ────────────────────────────────
-
-@register_keras_serializable(package='Dorsal PalmVein')
+@register_keras_serializable(package='PalmVein')
 class L2NormalizeLayer(layers.Layer):
-    """L2-normalizes embeddings along axis=1."""
     def call(self, x):
         return tf.math.l2_normalize(x, axis=1)
-    def get_config(self):
-        return super().get_config()
-
-
-@register_keras_serializable(package='Dorsal PalmVein')
-class EuclideanDistanceLayer(layers.Layer):
-    """Euclidean distance between two embedding vectors."""
-    def call(self, inputs):
-        a, b = inputs
-        return tf.norm(a - b, axis=1, keepdims=True)
     def get_config(self):
         return super().get_config()
 
@@ -348,6 +194,7 @@ class EuclideanDistanceLayer(layers.Layer):
 def build_backbone(img_size, channels, embedding_dim):
     inputs = Input(shape=(img_size, img_size, channels), name='input')
 
+    # Block 1
     x = layers.Conv2D(32, 3, padding='same', name='conv1_1')(inputs)
     x = layers.BatchNormalization(name='bn1_1')(x)
     x = layers.ReLU(name='relu1_1')(x)
@@ -355,8 +202,8 @@ def build_backbone(img_size, channels, embedding_dim):
     x = layers.BatchNormalization(name='bn1_2')(x)
     x = layers.ReLU(name='relu1_2')(x)
     x = layers.MaxPooling2D(2, name='pool1')(x)
-    x = layers.Dropout(0.15, name='drop1')(x)
 
+    # Block 2
     x = layers.Conv2D(64, 3, padding='same', name='conv2_1')(x)
     x = layers.BatchNormalization(name='bn2_1')(x)
     x = layers.ReLU(name='relu2_1')(x)
@@ -364,8 +211,8 @@ def build_backbone(img_size, channels, embedding_dim):
     x = layers.BatchNormalization(name='bn2_2')(x)
     x = layers.ReLU(name='relu2_2')(x)
     x = layers.MaxPooling2D(2, name='pool2')(x)
-    x = layers.Dropout(0.15, name='drop2')(x)
 
+    # Block 3
     x = layers.Conv2D(128, 3, padding='same', name='conv3_1')(x)
     x = layers.BatchNormalization(name='bn3_1')(x)
     x = layers.ReLU(name='relu3_1')(x)
@@ -373,14 +220,17 @@ def build_backbone(img_size, channels, embedding_dim):
     x = layers.BatchNormalization(name='bn3_2')(x)
     x = layers.ReLU(name='relu3_2')(x)
     x = layers.MaxPooling2D(2, name='pool3')(x)
-    x = layers.Dropout(0.15, name='drop3')(x)
 
+    # Block 4 — symmetric
     x = layers.Conv2D(256, 3, padding='same', name='conv4_1')(x)
     x = layers.BatchNormalization(name='bn4_1')(x)
     x = layers.ReLU(name='relu4_1')(x)
+    x = layers.Conv2D(256, 3, padding='same', name='conv4_2')(x)
+    x = layers.BatchNormalization(name='bn4_2')(x)
+    x = layers.ReLU(name='relu4_2')(x)
     x = layers.MaxPooling2D(2, name='pool4')(x)
-    x = layers.Dropout(0.15, name='drop4')(x)
 
+    # Head
     x = layers.GlobalAveragePooling2D(name='gap')(x)
     x = layers.Dense(256, name='dense1')(x)
     x = layers.BatchNormalization(name='bn_dense')(x)
@@ -388,42 +238,185 @@ def build_backbone(img_size, channels, embedding_dim):
     x = layers.Dropout(0.2, name='drop_dense')(x)
     x = layers.Dense(embedding_dim, name='embedding')(x)
     outputs = L2NormalizeLayer(name='l2_norm')(x)
+
     return Model(inputs, outputs, name='cnn_backbone')
 
 
-def build_siamese(backbone):
-    shape = (CONFIG['img_size'], CONFIG['img_size'], CONFIG['channels'])
-    in_a  = Input(shape=shape, name='input_a')
-    in_b  = Input(shape=shape, name='input_b')
-    emb_a = backbone(in_a)
-    emb_b = backbone(in_b)
-    dist  = EuclideanDistanceLayer(name='euclidean_dist')([emb_a, emb_b])
-    return Model(inputs=[in_a, in_b], outputs=dist, name='siamese')
+# ────────────────────────────────
+#  ONLINE SEMI-HARD TRIPLET LOSS
+# ────────────────────────────────
 
-
-def contrastive_loss(margin=1.0):
+def online_semi_hard_triplet_loss(margin=1.5):
     def loss(y_true, y_pred):
-        y = tf.cast(y_true, tf.float32)
-        d = tf.squeeze(y_pred, axis=1)
-        return tf.reduce_mean(
-            (1.0 - y) * tf.square(d)
-            + y * tf.square(tf.maximum(margin - d, 0.0))
+        embeddings = tf.cast(y_pred, tf.float32)
+        labels     = tf.cast(tf.squeeze(y_true), tf.int32)
+
+        # Pairwise distance matrix
+        dot        = tf.matmul(embeddings, tf.transpose(embeddings))
+        sq_norm    = tf.linalg.diag_part(dot)
+        distances  = tf.maximum(sq_norm[:, None] - 2.0 * dot + sq_norm[None, :], 0.0)
+        distances  = tf.sqrt(distances + 1e-12)
+
+        # Masks — all ops vectorized, no Python loop
+        labels_col = tf.expand_dims(labels, 1)
+        labels_row = tf.expand_dims(labels, 0)
+        same_id    = tf.equal(labels_col, labels_row)
+        diff_id    = tf.logical_not(same_id)
+        not_self   = tf.logical_not(tf.eye(tf.shape(labels)[0], dtype=tf.bool))
+        pos_mask   = tf.logical_and(same_id, not_self)
+        neg_mask   = diff_id
+
+        # Hardest positive per anchor — same identity, max distance
+        pos_dist   = tf.where(pos_mask, distances, tf.zeros_like(distances))
+        d_pos      = tf.reduce_max(pos_dist, axis=1, keepdims=True)  # (batch, 1)
+
+        # Semi-hard negatives — diff identity where d_pos < d_neg < d_pos + margin
+        neg_dist       = tf.where(neg_mask, distances, tf.fill(tf.shape(distances), 1e9))
+        semi_hard_mask = tf.logical_and(
+            neg_dist > d_pos,
+            neg_dist < d_pos + margin
         )
+
+        # Closest semi-hard negative per anchor
+        semi_hard_dist = tf.where(semi_hard_mask, neg_dist, tf.fill(tf.shape(neg_dist), 1e9))
+        d_neg_semi     = tf.reduce_min(semi_hard_dist, axis=1)
+
+        # Fallback — hardest negative (for anchors with no semi-hard)
+        d_neg_hard     = tf.reduce_min(neg_dist, axis=1)
+
+        # Use semi-hard if exists, else hardest negative
+        has_semi_hard  = tf.reduce_any(semi_hard_mask, axis=1)
+        d_neg          = tf.where(has_semi_hard, d_neg_semi, d_neg_hard)
+
+        triplet_loss   = tf.maximum(tf.squeeze(d_pos) - d_neg + margin, 0.0)
+        return tf.reduce_mean(triplet_loss)
+
     return loss
+
+
+# ────────────────────────────────
+#  CALLBACKS
+# ────────────────────────────────
+
+class BackboneCheckpoint(tf.keras.callbacks.Callback):
+    def __init__(self, backbone, ckpt_dir):
+        super().__init__()
+        self.backbone = backbone
+        self.ckpt_dir = ckpt_dir
+
+    def on_epoch_end(self, epoch, logs=None):
+        path     = os.path.join(self.ckpt_dir, f'backbone_epoch_{epoch+1:02d}.h5')
+        val_loss = logs.get('val_loss', float('nan'))
+        self.backbone.save(path)
+        print(f'  Backbone checkpoint saved: backbone_epoch_{epoch+1:02d}.h5'
+              f'  (val_loss={val_loss:.4f})')
+
+
+class BestBackboneCheckpoint(tf.keras.callbacks.Callback):
+    """Saves backbone (not the wrapper model) when val_loss improves."""
+    def __init__(self, backbone, path):
+        super().__init__()
+        self.backbone  = backbone
+        self.path      = path
+        self.best_loss = float('inf')
+
+    def on_epoch_end(self, epoch, logs=None):
+        val_loss = logs.get('val_loss', float('inf'))
+        if val_loss < self.best_loss:
+            self.best_loss = val_loss
+            self.backbone.save(self.path)
+            print(f'  Best backbone saved  (val_loss={val_loss:.4f})')
+
+
+class CosineAnnealingLR(tf.keras.callbacks.Callback):
+    def __init__(self, max_lr, min_lr, epochs, warmup_epochs, restart_every):
+        super().__init__()
+        self.max_lr = max_lr
+        self.min_lr = min_lr
+        self.epochs = epochs
+        self.warmup_epochs = warmup_epochs
+        self.restart_every = restart_every
+
+    def on_epoch_begin(self, epoch, logs=None):
+        if epoch < self.warmup_epochs:
+            lr = self.min_lr + (self.max_lr - self.min_lr) * (epoch / self.warmup_epochs)
+        else:
+            cycle_epoch = (epoch - self.warmup_epochs) % self.restart_every
+            lr = self.min_lr + 0.5 * (self.max_lr - self.min_lr) * (
+                1 + np.cos(np.pi * cycle_epoch / self.restart_every)
+            )
+        self.model.optimizer.learning_rate.assign(lr)
+
+
+# ────────────────────────────────
+#  WRAPPER MODEL
+# ────────────────────────────────
+
+def build_wrapper(backbone):
+    """
+    Wraps backbone so model.fit() works with identity batch generator.
+    Input: batch of images
+    Output: embeddings (loss computed by online_semi_hard_triplet_loss)
+    """
+    sz     = CONFIG['img_size']
+    ch     = CONFIG['channels']
+    inputs = Input(shape=(sz, sz, ch), name='input')
+    embs   = backbone(inputs)
+    return Model(inputs=inputs, outputs=embs, name='wrapper')
 
 
 # ────────────────────────────────
 #  EVALUATION
 # ────────────────────────────────
 
-def get_distances(backbone, generator):
+def get_pair_distances(backbone, class_map, n_pairs=5000):
+    """Generate genuine/impostor pairs and compute distances for evaluation."""
+    class_list = list(class_map.keys())
+    pairs      = []
+
+    for identity, paths in class_map.items():
+        for a, b in combinations(paths, 2):
+            pairs.append((a, b, 0))
+
+    neg_target = min(len(pairs), n_pairs // 2)
+    seen       = set()
+    neg_count  = 0
+    for _ in range(neg_target * 10):
+        if neg_count >= neg_target:
+            break
+        c1, c2 = random.sample(class_list, 2)
+        a = random.choice(class_map[c1])
+        b = random.choice(class_map[c2])
+        key = (min(a, b), max(a, b))
+        if key not in seen:
+            seen.add(key)
+            pairs.append((a, b, 1))
+            neg_count += 1
+
+    random.shuffle(pairs)
+    if len(pairs) > n_pairs:
+        pairs = random.sample(pairs, n_pairs)
+
+    sz = CONFIG['img_size']
+    ch = CONFIG['channels']
+    bs = 128
+
     all_dist, all_labels = [], []
-    for i in range(len(generator)):
-        (A, B), labels = generator[i]
+    for i in range(0, len(pairs), bs):
+        batch = pairs[i : i + bs]
+        A = np.zeros((len(batch), sz, sz, ch), dtype=np.float32)
+        B = np.zeros((len(batch), sz, sz, ch), dtype=np.float32)
+        L = []
+        for j, (pa, pb, label) in enumerate(batch):
+            A[j] = load_image(pa)
+            B[j] = load_image(pb)
+            L.append(label)
         emb_a = backbone(A, training=False).numpy()
         emb_b = backbone(B, training=False).numpy()
-        all_dist.extend(np.linalg.norm(emb_a - emb_b, axis=1).tolist())
-        all_labels.extend(labels.tolist())
+        dists = np.linalg.norm(emb_a - emb_b, axis=1)
+        all_dist.extend(dists.tolist())
+        all_labels.extend(L)
+
     return np.array(all_dist), np.array(all_labels)
 
 
@@ -444,18 +437,15 @@ def compute_far_frr_eer(dists, labels, steps=500):
     thresholds = np.linspace(0, 2, steps)
     genuine    = dists[labels == 0]
     impostor   = dists[labels == 1]
-
     far_list, frr_list = [], []
     for t in thresholds:
         far_list.append(float(np.mean(impostor < t)))
         frr_list.append(float(np.mean(genuine  >= t)))
-
-    far_arr  = np.array(far_list)
-    frr_arr  = np.array(frr_list)
-    diff     = np.abs(far_arr - frr_arr)
-    eer_idx  = np.argmin(diff)
-    eer      = float((far_arr[eer_idx] + frr_arr[eer_idx]) / 2)
-
+    far_arr = np.array(far_list)
+    frr_arr = np.array(frr_list)
+    diff    = np.abs(far_arr - frr_arr)
+    eer_idx = np.argmin(diff)
+    eer     = float((far_arr[eer_idx] + frr_arr[eer_idx]) / 2)
     return {
         'thresholds': thresholds,
         'far':        far_arr,
@@ -489,7 +479,6 @@ def export_tflite(backbone, train_map, tflite_path):
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     converter.inference_input_type      = tf.float32
     converter.inference_output_type     = tf.float32
-
     tflite_model = converter.convert()
     with open(tflite_path, 'wb') as f:
         f.write(tflite_model)
@@ -504,17 +493,11 @@ def save_training_plot(history, path):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     axes[0].plot(history.history['loss'],     label='Train')
     axes[0].plot(history.history['val_loss'], label='Val')
-    axes[0].set_title('Contrastive Loss')
+    axes[0].set_title('Triplet Loss (Online Semi-Hard Mining)')
     axes[0].set_xlabel('Epoch')
     axes[0].legend()
     axes[0].grid(True)
-    if 'lr' in history.history:
-        axes[1].plot(history.history['lr'], color='orange')
-        axes[1].set_title('Learning Rate')
-        axes[1].set_xlabel('Epoch')
-        axes[1].grid(True)
-    else:
-        axes[1].axis('off')
+    axes[1].axis('off')
     plt.tight_layout()
     plt.savefig(path)
     plt.close(fig)
@@ -522,116 +505,94 @@ def save_training_plot(history, path):
 
 
 # ────────────────────────────────
-#  MAIN TRAIN FUNCTION
+#  MAIN
 # ────────────────────────────────
 
-def train(processed_dir, finetune=False):
-    mode = 'FINE-TUNE' if finetune else 'SCRATCH'
+def train(processed_dir):
     print('=' * 60)
-    print(f'Dorsal Palm VEIN TRAINING  [{mode} + Hard Negative Mining]')
+    print('PALM VEIN TRAINING  [Triplet Loss + Online Semi-Hard Mining]')
     print('=' * 60)
-    print(f'  Data   : {processed_dir}')
-    print(f'  Output : {CONFIG["output_dir"]}')
-    print(f'  Size   : {CONFIG["img_size"]}x{CONFIG["img_size"]}')
-    print(f'  Checkpoints: {CONFIG["ckpt_dir"]}')
+    print(f'  Data         : {processed_dir}')
+    print(f'  Output       : {OUTPUT_DIR}')
+    print(f'  Size         : {CONFIG["img_size"]}x{CONFIG["img_size"]}')
+    print(f'  Embedding dim: {CONFIG["embedding_dim"]}')
+    print(f'  Margin       : {CONFIG["margin"]}')
+    print(f'  Batch        : K={CONFIG["K"]} identities x N={CONFIG["N"]} images = {CONFIG["K"]*CONFIG["N"]}')
     print('=' * 60)
 
     class_map = load_dataset(processed_dir)
     train_map, val_map, test_map = split_classes(class_map)
 
-    print('\nGenerating initial pairs...')
-    train_pairs = generate_pairs(train_map, CONFIG['train_neg_ratio'])
-    val_pairs   = generate_pairs(val_map,   CONFIG['eval_neg_ratio'])
-    test_pairs  = generate_pairs(test_map,  CONFIG['eval_neg_ratio'])
-    n_positives = sum(1 for p in train_pairs if p[2] == 0)
+    steps_per_epoch = len(train_map) // CONFIG['K'] * 8  # ~3 passes per epoch
+    val_steps       = max(10, len(val_map) // CONFIG['K'])
 
-    train_gen = PairGenerator(train_pairs, CONFIG['batch_size'], augment=True)
-    val_gen   = PairGenerator(val_pairs,   CONFIG['batch_size'], augment=False)
-    test_gen  = PairGenerator(test_pairs,  CONFIG['batch_size'], augment=False)
+    print(f'\n  Steps/epoch  : {steps_per_epoch}')
+    print(f'  Val steps    : {val_steps}')
 
-    print('\nBuilding model...')
-    if finetune and os.path.exists(CONFIG['finetune_load_path']):
-        print(f'  Loading backbone for fine-tuning: {CONFIG["backbone_path"]}')
-        backbone = tf.keras.models.load_model(
-            CONFIG['finetune_load_path'],
-            custom_objects={
-                'L2NormalizeLayer':       L2NormalizeLayer,
-                'EuclideanDistanceLayer': EuclideanDistanceLayer,
-            }
-        )
-
-        # Freeze conv1 + conv2 — only fine-tune conv3, conv4, dense, embedding
-        for layer in backbone.layers:
-            layer.trainable = layer.name not in FINETUNE_FREEZE
-
-        frozen    = [l.name for l in backbone.layers if not l.trainable]
-        trainable = [l.name for l in backbone.layers if l.trainable]
-        print(f'  Frozen   : {frozen}')
-        print(f'  Trainable: {trainable}')
-
-        lr          = CONFIG['finetune_lr']
-        epochs      = CONFIG['finetune_epochs']
-        es_patience = CONFIG['finetune_es_patience']
-        lr_patience = CONFIG['finetune_lr_patience']
-
-    else:
-        if finetune:
-            raise FileNotFoundError(
-                f'Fine-tune requested but no backbone found at: {CONFIG["backbone_path"]}\n'
-                f'Copy cnn_backbone.h5 there before running with --finetune.'
-            )
-        backbone    = build_backbone(
-            CONFIG['img_size'], CONFIG['channels'], CONFIG['embedding_dim']
-        )
-        lr          = CONFIG['learning_rate']
-        epochs      = CONFIG['epochs']
-        es_patience = 10
-        lr_patience = 5
-
-    siamese = build_siamese(backbone)
-    # backbone.summary()
-    siamese.compile(
-        optimizer=Adam(learning_rate=lr),
-        loss=contrastive_loss(margin=CONFIG['margin'])
+    train_gen = IdentityBatchGenerator(
+        train_map, CONFIG['K'], CONFIG['N'],
+        augment=True, steps_per_epoch=steps_per_epoch
+    )
+    val_gen = IdentityBatchGenerator(
+        val_map, CONFIG['K'], CONFIG['N'],
+        augment=False, steps_per_epoch=val_steps
     )
 
-    print(f'\n  Mode        : {"fine-tune" if finetune else "scratch"}')
-    print(f'  LR          : {lr}')
-    print(f'  Max epochs  : {epochs}')
-    print(f'  ES patience : {es_patience}')
-    print(f'  LR patience : {lr_patience}')
+    print('\nBuilding model...')
+    backbone = build_backbone(CONFIG['img_size'], CONFIG['channels'], CONFIG['embedding_dim'])
+    wrapper  = build_wrapper(backbone)
+
+    trainable = sum(np.prod(v.shape) for v in backbone.trainable_weights)
+    print(f'  Backbone params: {trainable:,}')
+
+    wrapper.compile(
+        optimizer=Adam(learning_rate=CONFIG['learning_rate']),
+        loss=online_semi_hard_triplet_loss(margin=CONFIG['margin'])
+    )
+
+    print(f'\n  LR          : {CONFIG["learning_rate"]} (cosine anneal -> {CONFIG["min_lr"]})')
+    print(f'  Max epochs  : {CONFIG["epochs"]}')
+    print(f'  ES patience : {CONFIG["es_patience"]}')
 
     callbacks = [
-        HardNegativeMiningCallback(backbone, train_gen, train_map, n_positives),
+        BestBackboneCheckpoint(backbone, CONFIG['best_ckpt']),
         BackboneCheckpoint(backbone, CONFIG['ckpt_dir']),
-        ModelCheckpoint(CONFIG['siamese_ckpt'], monitor='val_loss',
-                        save_best_only=True, verbose=1),
-        EarlyStopping(monitor='val_loss', patience=es_patience,
+        CosineAnnealingLR(
+            max_lr=CONFIG['learning_rate'],
+            min_lr=CONFIG['min_lr'],
+            epochs=CONFIG['epochs'],
+            warmup_epochs=CONFIG['warmup_epochs'],
+            restart_every=CONFIG['restart_every'],
+        ),
+        EarlyStopping(monitor='val_loss', patience=CONFIG['es_patience'],
                       restore_best_weights=True, verbose=1),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5,
-                          patience=lr_patience, min_lr=1e-6, verbose=1),
-        CSVLogger(CONFIG['log_path'], append=finetune),
+        CSVLogger(CONFIG['log_path']),
     ]
 
     print('\nTraining...')
-    history = siamese.fit(
+    history = wrapper.fit(
         train_gen,
         validation_data=val_gen,
-        epochs=epochs,
+        epochs=CONFIG['epochs'],
         callbacks=callbacks,
         verbose=1,
     )
 
-    backbone.save(CONFIG['backbone_path'])
-    print(f'Final backbone saved: {CONFIG["backbone_path"]}')
+    # Load best backbone for evaluation
+    best_backbone = tf.keras.models.load_model(
+        CONFIG['best_ckpt'],
+        custom_objects={'L2NormalizeLayer': L2NormalizeLayer}
+    )
+    best_backbone.save(CONFIG['backbone_path'])
+    print(f'Best backbone saved: {CONFIG["backbone_path"]}')
 
     print('\nCalibrating threshold on validation set...')
-    val_dists, val_labels = get_distances(backbone, val_gen)
+    val_dists, val_labels = get_pair_distances(best_backbone, val_map)
     best_thresh, val_acc  = find_best_threshold(val_dists, val_labels)
     print(f'  Val accuracy  : {val_acc*100:.2f}%  threshold={best_thresh:.4f}')
 
     print('\nEvaluating on test set...')
-    test_dists, test_labels = get_distances(backbone, test_gen)
+    test_dists, test_labels = get_pair_distances(best_backbone, test_map)
     test_acc = accuracy_at_threshold(test_dists, test_labels, best_thresh)
     metrics  = compute_far_frr_eer(test_dists, test_labels)
 
@@ -644,7 +605,7 @@ def train(processed_dir, finetune=False):
     print(f'  FRR@EER   : {metrics["frr_at_eer"]*100:.2f}%')
     print(f'{"="*60}')
 
-    export_tflite(backbone, train_map, CONFIG['tflite_path'])
+    export_tflite(best_backbone, train_map, CONFIG['tflite_path'])
 
     deploy_cfg = {
         'tflite_path':   CONFIG['tflite_path'],
@@ -661,8 +622,7 @@ def train(processed_dir, finetune=False):
     print(f'Deployment config saved: {CONFIG["deploy_config"]}')
 
     save_training_plot(history, CONFIG['plot_path'])
-
-    return backbone, history, best_thresh, metrics
+    return best_backbone, history, best_thresh, metrics
 
 
 # ────────────────────────────────
@@ -671,14 +631,10 @@ def train(processed_dir, finetune=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data',     required=True,  help='Path to processed_dataset/')
-    parser.add_argument('--finetune', action='store_true')
+    parser.add_argument('--data', required=True, help='Path to processed_dataset/')
     args = parser.parse_args()
 
-    backbone, history, threshold, metrics = train(
-        processed_dir=args.data,
-        finetune=args.finetune
-    )
+    backbone, history, threshold, metrics = train(processed_dir=args.data)
 
     print('\n' + '=' * 60)
     print('DONE')

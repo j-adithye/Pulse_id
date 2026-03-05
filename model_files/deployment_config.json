@@ -1,0 +1,10 @@
+{
+  "tflite_path": "/kaggle/working/output/cnn_backbone.tflite",
+  "backbone_path": "/kaggle/working/output/cnn_backbone.h5",
+  "threshold": 0.6092184368737474,
+  "embedding_dim": 128,
+  "img_size": 128,
+  "eer": 0.0010482180293501049,
+  "far_at_eer": 0.0008385744234800838,
+  "frr_at_eer": 0.0012578616352201257
+}

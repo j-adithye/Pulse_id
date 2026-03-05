@@ -30,7 +30,7 @@ from scipy.ndimage import uniform_filter1d
 #  CONFIGURATION  -- edit these values to tune the pipeline
 # ==============================================================================
 
-IMAGE_PATH  = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\dataset\\person15\\vein_1.jpg"
+IMAGE_PATH  = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\dataset\\person42\\vein_8.jpg"
 OUTPUT_PATH = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\image\\vein_processed.png"
 
 # -- Otsu threshold offset -----------------------------------------------------
@@ -45,11 +45,11 @@ OTSU_OFFSET = -20
 #   0.15 = cut where the hand has widened 15% above the wrist plateau (safe)
 #   Lower = tighter cut (closer to wrist crease)
 #   Higher = more conservative cut (removes more wrist)
-WRIST_JUNCTION_RISE = 0.15
+WRIST_JUNCTION_RISE = 0.13
 
 # -- Sato filter -------------------------------------------------------------
-Sato_SCALE_MIN  = 3    # minimum vein thickness to detect (pixels)
-Sato_SCALE_MAX  = 3    # maximum vein thickness to detect (pixels)
+Sato_SCALE_MIN  = 5    # minimum vein thickness to detect (pixels)
+Sato_SCALE_MAX  = 5    # maximum vein thickness to detect (pixels)
 Sato_SCALE_STEP = 1    # step between scales (1 = thorough, 2 = faster)
 
 
@@ -63,8 +63,8 @@ Sato_SCALE_STEP = 1    # step between scales (1 = thorough, 2 = faster)
 #                          Increase to keep more,  decrease for a tighter cut.
 #   MCP_DEFECT_DEPTH_MIN : minimum convexity defect depth (px) treated as a
 #                          real finger valley.  Raise if false valleys appear.
-MCP_SAFETY_MARGIN    = 0.03
-MCP_DEFECT_DEPTH_MIN = 20    # pixels
+MCP_SAFETY_MARGIN    = 0.05
+MCP_DEFECT_DEPTH_MIN = 40    # pixels
 
 # -- Output size ---------------------------------------------------------------
 #   224 is recommended for Pi deployment: small model, fast inference.
@@ -653,13 +653,13 @@ if __name__ == "__main__":
 
     print("\n[Step 9] Apply feathered mask + CLAHE post")
     img_Sato      = apply_feathered_mask(img_Sato, mask, fade_px=12)
-    img_clahe_post = apply_clahe(img_Sato,
-                                 clip_limit=CLAHE_POST_CLIP,
-                                 tile_size=CLAHE_TILE_SIZE,
-                                 label="post-Sato")
+    # img_clahe_post = apply_clahe(img_Sato,
+    #                              clip_limit=CLAHE_POST_CLIP,
+    #                              tile_size=CLAHE_TILE_SIZE,
+    #                              label="post-Sato")
 
     print("\n[Step 10] Tight Crop + Resize")
-    img_resized = pad_and_resize(img_clahe_post, mask, target_size=TARGET_SIZE)
+    img_resized = pad_and_resize(img_Sato, mask, target_size=TARGET_SIZE)
 
     print("\n[Step 11] Normalize")
     img_normalized = normalize_image(img_resized)
@@ -684,7 +684,7 @@ if __name__ == "__main__":
         (img_segmented,  "4. Segmented"),
         (img_clahe_pre,  "5. CLAHE Pre-Sato"),
         (img_Sato,       "6. Sato Filter"),
-        (img_clahe_post, "7. CLAHE Post-Sato"),
+        (img_Sato, "7. CLAHE Post-Sato"),
         (img_save,       f"8. {TARGET_SIZE}x{TARGET_SIZE} Normalized"),
     ]
     visualize_pipeline(stages)
