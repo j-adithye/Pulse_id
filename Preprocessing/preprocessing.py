@@ -24,14 +24,15 @@ import numpy as np
 import time
 import os
 from scipy.ndimage import uniform_filter1d
+from dotenv import load_dotenv
 
 
 # ==============================================================================
 #  CONFIGURATION  -- edit these values to tune the pipeline
 # ==============================================================================
-
-IMAGE_PATH  = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\dataset\\person42\\vein_8.jpg"
-OUTPUT_PATH = "C:\\Users\\adith\\OneDrive\\Documents\\py\\Pulse_id\\image\\vein_processed.png"
+load_dotenv()
+IMAGE_PATH  = os.getenv("IMAGE_PATH")
+OUTPUT_PATH = os.getenv("OUTPUT_PATH")
 
 # -- Otsu threshold offset -----------------------------------------------------
 #   0   = pure Otsu (automatic)
